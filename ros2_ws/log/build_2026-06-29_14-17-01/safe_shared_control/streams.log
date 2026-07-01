@@ -1,0 +1,38 @@
+[1.195s] Invoking command in '/home/veeti/dippa/ros2_ws/src/safe_shared_control': PYTHONPATH=/home/veeti/dippa/ros2_ws/build/safe_shared_control/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated setup.py egg_info --egg-base ../../build/safe_shared_control build --build-base /home/veeti/dippa/ros2_ws/build/safe_shared_control/build install --record /home/veeti/dippa/ros2_ws/build/safe_shared_control/install.log --single-version-externally-managed install_data
+[1.451s] /home/veeti/.local/lib/python3.10/site-packages/setuptools/_distutils/dist.py:289: UserWarning: Unknown distribution option: 'tests_require'
+[1.451s]   warnings.warn(msg)
+[1.639s] running egg_info
+[1.667s] writing ../../build/safe_shared_control/safe_shared_control.egg-info/PKG-INFO
+[1.667s] writing dependency_links to ../../build/safe_shared_control/safe_shared_control.egg-info/dependency_links.txt
+[1.668s] writing entry points to ../../build/safe_shared_control/safe_shared_control.egg-info/entry_points.txt
+[1.668s] writing requirements to ../../build/safe_shared_control/safe_shared_control.egg-info/requires.txt
+[1.668s] writing top-level names to ../../build/safe_shared_control/safe_shared_control.egg-info/top_level.txt
+[1.734s] reading manifest file '../../build/safe_shared_control/safe_shared_control.egg-info/SOURCES.txt'
+[1.736s] writing manifest file '../../build/safe_shared_control/safe_shared_control.egg-info/SOURCES.txt'
+[1.736s] running build
+[1.736s] running build_py
+[1.736s] copying safe_shared_control/keyboard_teleop_node.py -> /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control
+[1.737s] copying safe_shared_control/afs_mpc_controller_node.py -> /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control
+[1.737s] copying safe_shared_control/__init__.py -> /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control
+[1.737s] copying safe_shared_control/simulator_node.py -> /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control
+[1.737s] copying safe_shared_control/controller_node.py -> /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control
+[1.738s] running install
+[1.743s] running install_lib
+[1.774s] copying /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control/afs_mpc_controller_node.py -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/python3.10/site-packages/safe_shared_control
+[1.775s] byte-compiling /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/python3.10/site-packages/safe_shared_control/afs_mpc_controller_node.py to afs_mpc_controller_node.cpython-310.pyc
+[1.781s] running install_data
+[1.782s] copying resource/safe_shared_control -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/share/ament_index/resource_index/packages
+[1.782s] copying package.xml -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/share/safe_shared_control
+[1.782s] copying launch/safe_shared_control.launch.py -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/share/safe_shared_control/launch
+[1.782s] copying rviz/afs.rviz -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/share/safe_shared_control/rviz
+[1.783s] copying rviz/afs_mpc.rviz -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/share/safe_shared_control/rviz
+[1.784s] running install_egg_info
+[1.827s] removing '/home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/python3.10/site-packages/safe_shared_control-0.0.0-py3.10.egg-info' (and everything under it)
+[1.827s] Copying ../../build/safe_shared_control/safe_shared_control.egg-info to /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/python3.10/site-packages/safe_shared_control-0.0.0-py3.10.egg-info
+[1.828s] running install_scripts
+[1.908s] Installing controller_node script to /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/safe_shared_control
+[1.908s] Installing keyboard_teleop_node script to /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/safe_shared_control
+[1.908s] Installing mpc_controller_node script to /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/safe_shared_control
+[1.909s] Installing simulator_node script to /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/safe_shared_control
+[1.909s] writing list of installed files to '/home/veeti/dippa/ros2_ws/build/safe_shared_control/install.log'
+[1.973s] Invoked command in '/home/veeti/dippa/ros2_ws/src/safe_shared_control' returned '0': PYTHONPATH=/home/veeti/dippa/ros2_ws/build/safe_shared_control/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated setup.py egg_info --egg-base ../../build/safe_shared_control build --build-base /home/veeti/dippa/ros2_ws/build/safe_shared_control/build install --record /home/veeti/dippa/ros2_ws/build/safe_shared_control/install.log --single-version-externally-managed install_data

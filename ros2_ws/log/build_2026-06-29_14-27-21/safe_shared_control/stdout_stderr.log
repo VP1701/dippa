@@ -1,0 +1,36 @@
+/home/veeti/.local/lib/python3.10/site-packages/setuptools/_distutils/dist.py:289: UserWarning: Unknown distribution option: 'tests_require'
+  warnings.warn(msg)
+running egg_info
+writing ../../build/safe_shared_control/safe_shared_control.egg-info/PKG-INFO
+writing dependency_links to ../../build/safe_shared_control/safe_shared_control.egg-info/dependency_links.txt
+writing entry points to ../../build/safe_shared_control/safe_shared_control.egg-info/entry_points.txt
+writing requirements to ../../build/safe_shared_control/safe_shared_control.egg-info/requires.txt
+writing top-level names to ../../build/safe_shared_control/safe_shared_control.egg-info/top_level.txt
+reading manifest file '../../build/safe_shared_control/safe_shared_control.egg-info/SOURCES.txt'
+writing manifest file '../../build/safe_shared_control/safe_shared_control.egg-info/SOURCES.txt'
+running build
+running build_py
+copying safe_shared_control/keyboard_teleop_node.py -> /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control
+copying safe_shared_control/afs_mpc_controller_node.py -> /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control
+copying safe_shared_control/__init__.py -> /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control
+copying safe_shared_control/simulator_node.py -> /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control
+copying safe_shared_control/controller_node.py -> /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control
+running install
+running install_lib
+copying /home/veeti/dippa/ros2_ws/build/safe_shared_control/build/lib/safe_shared_control/keyboard_teleop_node.py -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/python3.10/site-packages/safe_shared_control
+byte-compiling /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/python3.10/site-packages/safe_shared_control/keyboard_teleop_node.py to keyboard_teleop_node.cpython-310.pyc
+running install_data
+copying resource/safe_shared_control -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/share/ament_index/resource_index/packages
+copying package.xml -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/share/safe_shared_control
+copying launch/safe_shared_control.launch.py -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/share/safe_shared_control/launch
+copying rviz/afs.rviz -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/share/safe_shared_control/rviz
+copying rviz/afs_mpc.rviz -> /home/veeti/dippa/ros2_ws/install/safe_shared_control/share/safe_shared_control/rviz
+running install_egg_info
+removing '/home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/python3.10/site-packages/safe_shared_control-0.0.0-py3.10.egg-info' (and everything under it)
+Copying ../../build/safe_shared_control/safe_shared_control.egg-info to /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/python3.10/site-packages/safe_shared_control-0.0.0-py3.10.egg-info
+running install_scripts
+Installing controller_node script to /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/safe_shared_control
+Installing keyboard_teleop_node script to /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/safe_shared_control
+Installing mpc_controller_node script to /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/safe_shared_control
+Installing simulator_node script to /home/veeti/dippa/ros2_ws/install/safe_shared_control/lib/safe_shared_control
+writing list of installed files to '/home/veeti/dippa/ros2_ws/build/safe_shared_control/install.log'
