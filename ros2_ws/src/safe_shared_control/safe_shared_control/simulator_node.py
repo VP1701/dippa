@@ -15,26 +15,46 @@ front axle F: hinge P = F - L_f*e_f, rear axle R = P - L_r*e_r.
 
 This node is the PLANT ONLY (no safety filtering -- that is the controller node).
 
+------------------------------------------------------------------- MAP
+Ground truth is now a STATIC pre-built map (standard ROS map_server format:
+a `.yaml` + `.pgm` pair) instead of a simulated LIDAR sweep. There is no
+raycasting and no `/scan` topic any more -- the whole map is published once
+(latched via TRANSIENT_LOCAL QoS) on `/map` as a nav_msgs/OccupancyGrid, and
+the controller consumes that directly as its known-obstacle grid.
+
+`map_yaml` (param) points at the map file. YAML fields follow map_server:
+    image: <path to .pgm, relative to the yaml file unless absolute>
+    resolution: <m/pixel>
+    origin: [x, y, yaw]     # world pose of the pixel at row 0 (bottom of map)
+    negate: 0 or 1
+    occupied_thresh: 0..1
+    free_thresh: 0..1
+A bundled default map (`maps/default_map.yaml`) reproduces the previous
+hardcoded arena so nothing else needs to change to try this out.
+
 ------------------------------------------------------------------ INTERFACE
 Subscribes:  /afs/cmd  std_msgs/Float64MultiArray   data = [v_f, omega]
              /cmd_vel  geometry_msgs/Twist          linear.x = v_f, angular.z = omega
-Publishes:   /scan (sensor_msgs/LaserScan, frame front_lidar),
+Publishes:   /map (nav_msgs/OccupancyGrid, latched, the static ground-truth map),
              /odom (nav_msgs/Odometry, odom->base_link at the FRONT axle),
              /afs/articulation (std_msgs/Float64, gamma),
              /afs/collision (std_msgs/Bool),
-             /afs/markers (visualization_msgs/MarkerArray)
-TF: odom -> base_link(front axle) -> hinge -> rear_link ; base_link -> front_lidar
+             /afs/markers (visualization_msgs/MarkerArray, vehicle body only --
+                           obstacles are shown via RViz's Map display on /map)
+TF: odom -> base_link(front axle) -> hinge -> rear_link
 """
 import math
+import os
+
 import numpy as np
+import yaml
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 from std_msgs.msg import Float64, Bool, Float64MultiArray
 from geometry_msgs.msg import Twist, TransformStamped, Quaternion
-from nav_msgs.msg import Odometry
-from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry, OccupancyGrid
 from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import TransformBroadcaster
 
@@ -44,52 +64,131 @@ def yaw_to_quat(yaw):
     return q
 
 
+# --------------------------------------------------------------------------- #
+# Static map loading (ROS map_server .yaml + .pgm)                            #
+# --------------------------------------------------------------------------- #
+def _read_pgm(path):
+    """Minimal PGM reader (P5 binary or P2 ascii), no Pillow dependency."""
+    with open(path, 'rb') as f:
+        magic = f.readline().strip()
+        if magic not in (b'P5', b'P2'):
+            raise ValueError(f"Unsupported PGM magic {magic!r} in {path} (need P5 or P2)")
+
+        def _next_token():
+            tok = b''
+            while True:
+                c = f.read(1)
+                if not c:
+                    raise ValueError(f"Unexpected EOF reading PGM header of {path}")
+                if c == b'#':
+                    f.readline()
+                    continue
+                if c.isspace():
+                    if tok:
+                        return tok
+                    continue
+                tok += c
+
+        width = int(_next_token())
+        height = int(_next_token())
+        maxval = int(_next_token())
+        if magic == b'P5':
+            dtype = np.uint8 if maxval < 256 else '>u2'
+            nbytes = width * height * (1 if maxval < 256 else 2)
+            data = np.frombuffer(f.read(nbytes), dtype=dtype)
+        else:  # P2 ascii
+            vals = f.read().split()
+            data = np.array(vals[:width * height], dtype=np.int64)
+        return data.reshape((height, width)).astype(np.float64), maxval
+
+
+def load_ros_map(yaml_path):
+    """Load a map_server-style map (yaml + pgm).
+
+    Returns dict with:
+      prob      (ny,nx) float64 in [0,1], occupancy probability. Row 0 is the
+                BOTTOM of the map (y = origin_y), matching nav_msgs/OccupancyGrid.
+      occupied  (ny,nx) bool  -- prob > occupied_thresh
+      free      (ny,nx) bool  -- prob < free_thresh
+      res       float, meters/pixel
+      origin    (x, y) world coords of the bottom-left cell of the grid
+      nx, ny    grid dimensions
+    """
+    yaml_path = os.path.abspath(yaml_path)
+    with open(yaml_path, 'r') as f:
+        meta = yaml.safe_load(f)
+    base = os.path.dirname(yaml_path)
+    image_path = meta['image']
+    if not os.path.isabs(image_path):
+        image_path = os.path.join(base, image_path)
+
+    res = float(meta.get('resolution', 0.05))
+    origin = meta.get('origin', [0.0, 0.0, 0.0])
+    negate = int(meta.get('negate', 0))
+    occ_th = float(meta.get('occupied_thresh', 0.65))
+    free_th = float(meta.get('free_thresh', 0.196))
+
+    raw, maxval = _read_pgm(image_path)
+    # map_server: white pixels = free, black = occupied (unless negate=1)
+    value = (raw / maxval) if negate else ((maxval - raw) / maxval)
+    # file row 0 is the TOP of the image == max y == last row of the grid
+    value = np.flipud(value)
+
+    occupied = value > occ_th
+    free = value < free_th
+    ny, nx = value.shape
+    return {'prob': value, 'occupied': occupied, 'free': free, 'res': res,
+            'origin': (float(origin[0]), float(origin[1])), 'nx': nx, 'ny': ny}
+
+
+def _default_map_path():
+    """Look for the bundled sample map next to this script (standalone /
+    `python3 afs_sim_node.py` use), then fall back to the installed package
+    share directory (`ros2 run` use)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.path.join(here, 'maps', 'default_map.yaml')
+    if os.path.exists(local):
+        return local
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share = get_package_share_directory('safe_shared_control')
+        cand = os.path.join(share, 'maps', 'default_map.yaml')
+        if os.path.exists(cand):
+            return cand
+    except Exception:
+        pass
+    return local  # will raise a clear FileNotFoundError downstream
+
+
+# --------------------------------------------------------------------------- #
+# Ground truth: static map + distance transform for collision checks          #
+# --------------------------------------------------------------------------- #
 class GroundTruthMap:
-    def __init__(self, width, height, res):
-        self.width, self.height, self.res = width, height, res
-        self.nx, self.ny = int(round(width / res)), int(round(height / res))
-        self.grid = np.zeros((self.ny, self.nx), dtype=bool)
-        self._build()
+    def __init__(self, yaml_path):
+        m = load_ros_map(yaml_path)
+        self.res = m['res']
+        self.origin = np.array(m['origin'], float)
+        self.ny, self.nx = m['ny'], m['nx']
+        self.occupied = m['occupied']
+        self.free = m['free']
         from scipy import ndimage
-        self.edt = ndimage.distance_transform_edt(~self.grid) * self.res
+        self.edt = ndimage.distance_transform_edt(~self.occupied) * self.res
 
-    def _rect(self, x0, y0, x1, y1):
-        i0, j0 = int(x0 / self.res), int(y0 / self.res)
-        i1, j1 = int(x1 / self.res), int(y1 / self.res)
-        self.grid[max(0, j0):min(self.ny, j1), max(0, i0):min(self.nx, i1)] = True
-
-    def _build(self):
-        W, H, t = self.width, self.height, 0.3
-        self._rect(0, 0, W, t); self._rect(0, H - t, W, H)
-        self._rect(0, 0, t, H); self._rect(W - t, 0, W, H)
-        self._rect(3.0, 3.0, 4.0, 5.2); self._rect(6.6, 1.0, 7.6, 3.2)
-        self._rect(8.6, 4.6, 9.8, 6.6); self._rect(4.8, 5.6, 6.0, 6.8)
-
-    def obstacle_rects(self):
-        return [(3.0, 3.0, 4.0, 5.2), (6.6, 1.0, 7.6, 3.2),
-                (8.6, 4.6, 9.8, 6.6), (4.8, 5.6, 6.0, 6.8)]
-
-    def raycast(self, origin, abs_angles, max_range):
-        step = self.res * 0.5
-        n_steps = max(1, int(max_range / step))
-        dirs = np.stack([np.cos(abs_angles), np.sin(abs_angles)], axis=1)
-        s = np.arange(1, n_steps + 1) * step
-        pts = np.asarray(origin)[None, None, :] + s[None, :, None] * dirs[:, None, :]
-        ix = (pts[..., 0] / self.res).astype(np.intp)
-        iy = (pts[..., 1] / self.res).astype(np.intp)
-        inb = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
-        occ = np.zeros(ix.shape, dtype=bool)
-        occ[inb] = self.grid[iy[inb], ix[inb]]
-        stop = occ | ~inb
-        has = stop.any(axis=1)
-        first = np.where(has, stop.argmax(axis=1), n_steps)
-        return np.where(has, (first + 1) * step, max_range).astype(np.float32)
+    def world_to_cell(self, p):
+        c = ((np.asarray(p) - self.origin) / self.res).astype(int)
+        return int(c[0]), int(c[1])
 
     def clearance(self, p):
-        ix, iy = int(p[0] / self.res), int(p[1] / self.res)
+        ix, iy = self.world_to_cell(p)
         if 0 <= ix < self.nx and 0 <= iy < self.ny:
             return float(self.edt[iy, ix])
         return 0.0
+
+    def occupancy_grid_data(self):
+        data = np.full((self.ny, self.nx), -1, dtype=np.int8)
+        data[self.free] = 0
+        data[self.occupied] = 100
+        return data
 
 
 class AFSKinematics:
@@ -141,20 +240,19 @@ class AFSSimNode(Node):
         self.v_max = p("v_max", 1.2).value
         self.omega_max = p("omega_max", 1.2).value
         self.sim_rate = p("sim_rate", 100.0).value
-        self.scan_rate = p("scan_rate", 15.0).value
-        self.n_rays = p("scan_rays", 540).value
-        self.max_range = p("scan_range", 8.0).value
-        self.arena_w = p("arena_width", 12.0).value
-        self.arena_h = p("arena_height", 8.0).value
+        self.map_yaml = p("map_yaml", _default_map_path()).value
         start = p("start_pose", [1.3, 1.3, 0.0, 0.0]).value
 
-        self.gt = GroundTruthMap(self.arena_w, self.arena_h, res=0.05)
+        self.gt = GroundTruthMap(self.map_yaml)
         self.kin = AFSKinematics(self.L_f, self.L_r, self.half_w, self.r_disc, self.g_max)
         self.state = np.array(start, dtype=float)
         self.cmd = np.zeros(2)            # [v_f, omega]
         self.dt = 1.0 / self.sim_rate
 
-        self.pub_scan = self.create_publisher(LaserScan, "scan", qos_profile_sensor_data)
+        map_qos = QoSProfile(depth=1, history=QoSHistoryPolicy.KEEP_LAST,
+                             reliability=QoSReliabilityPolicy.RELIABLE,
+                             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.pub_map = self.create_publisher(OccupancyGrid, "map", map_qos)
         self.pub_odom = self.create_publisher(Odometry, "odom", 10)
         self.pub_art = self.create_publisher(Float64, "afs/articulation", 10)
         self.pub_col = self.create_publisher(Bool, "afs/collision", 10)
@@ -163,10 +261,32 @@ class AFSSimNode(Node):
         self.create_subscription(Float64MultiArray, "afs/cmd", self.cmd_cb, 10)
         self.create_subscription(Twist, "cmd_vel", self.twist_cb, 10)
 
+        self._map_msg = self._build_map_msg()
+        self.pub_map.publish(self._map_msg)          # latched (transient local) copy
+        self.create_timer(2.0, self._republish_map)   # belt-and-braces for late RViz joins
+
         self.create_timer(self.dt, self.sim_step)
-        self.create_timer(1.0 / self.scan_rate, self.scan_step)
-        self.create_timer(1.0, self.publish_obstacle_markers)
-        self.get_logger().info("AFS sim (front-referenced) up. cmd [v_f, omega] on /afs/cmd or /cmd_vel.")
+        self.get_logger().info(
+            f"AFS sim (front-referenced) up. Static map loaded from {self.map_yaml} "
+            f"({self.gt.nx}x{self.gt.ny} @ {self.gt.res} m/cell). "
+            "cmd [v_f, omega] on /afs/cmd or /cmd_vel.")
+
+    def _build_map_msg(self):
+        msg = OccupancyGrid()
+        msg.header.frame_id = "odom"
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.info.resolution = float(self.gt.res)
+        msg.info.width = self.gt.nx
+        msg.info.height = self.gt.ny
+        msg.info.origin.position.x = float(self.gt.origin[0])
+        msg.info.origin.position.y = float(self.gt.origin[1])
+        msg.info.origin.orientation.w = 1.0
+        msg.data = self.gt.occupancy_grid_data().flatten().tolist()
+        return msg
+
+    def _republish_map(self):
+        self._map_msg.header.stamp = self.get_clock().now().to_msg()
+        self.pub_map.publish(self._map_msg)
 
     def cmd_cb(self, msg):
         if len(msg.data) >= 2:
@@ -197,22 +317,9 @@ class AFSSimNode(Node):
 
         # TF: front axle is base_link; hinge is L_f behind it; rear_link rotated by -gamma
         self._tf(now, "odom", "base_link", F[0], F[1], th_f)
-        self._tf(now, "base_link", "front_lidar", 0.0, 0.0, 0.0)
         self._tf(now, "base_link", "hinge", -self.L_f, 0.0, 0.0)
         self._tf(now, "hinge", "rear_link", 0.0, 0.0, -g)
         self.publish_body_markers(now, hit)
-
-    def scan_step(self):
-        F, P, R, th_f, th_r = self.kin.frames(self.state)
-        rel = np.linspace(-math.pi, math.pi, self.n_rays, endpoint=False)
-        ranges = self.gt.raycast(F, th_f + rel, self.max_range)
-        msg = LaserScan()
-        msg.header.stamp = self.get_clock().now().to_msg(); msg.header.frame_id = "front_lidar"
-        msg.angle_min = float(rel[0]); msg.angle_max = float(rel[-1])
-        msg.angle_increment = float(rel[1] - rel[0])
-        msg.range_min = 0.0; msg.range_max = float(self.max_range)
-        msg.ranges = ranges.tolist()
-        self.pub_scan.publish(msg)
 
     def _tf(self, stamp, parent, child, x, y, yaw):
         t = TransformStamped()
@@ -238,18 +345,6 @@ class AFSSimNode(Node):
                 m.color.g, m.color.b = 0.8, 0.9     # front = cyan
             else:
                 m.color.r, m.color.g = 1.0, 0.5     # rear = orange
-            ma.markers.append(m)
-        self.pub_mark.publish(ma)
-
-    def publish_obstacle_markers(self):
-        ma = MarkerArray()
-        for i, (x0, y0, x1, y1) in enumerate(self.gt.obstacle_rects()):
-            m = Marker(); m.header.stamp = self.get_clock().now().to_msg(); m.header.frame_id = "odom"
-            m.ns = "obstacles"; m.id = i; m.type = Marker.CUBE; m.action = Marker.ADD
-            m.pose.position.x = (x0 + x1) / 2; m.pose.position.y = (y0 + y1) / 2
-            m.pose.orientation.w = 1.0
-            m.scale.x = (x1 - x0); m.scale.y = (y1 - y0); m.scale.z = 0.5
-            m.color.a = 0.6; m.color.r = m.color.g = m.color.b = 0.5
             ma.markers.append(m)
         self.pub_mark.publish(ma)
 

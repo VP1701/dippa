@@ -4,13 +4,15 @@ afs_controller_node.py  --  ROS2 (Humble) Ponsse-handle controller + CBF filter
 ===============================================================================
 Controller side of the loop. It:
   1. reads the RIGHT Ponsse handle (sensor_msgs/Joy) -> raw command [v_f, omega]
-  2. builds an occupancy grid from /scan and extracts per-body CBF constraints
+  2. receives the static ground-truth map once (nav_msgs/OccupancyGrid on /map)
+     and extracts per-body CBF constraints directly from it (no incremental
+     mapping -- the obstacle layout is fully known up front)
   3. solves the minimal-intervention (v_f, omega) QP
   4. publishes the filtered command on /afs/cmd
 
 Pairs with afs_sim_node.py (front-referenced model):
 
-    THIS --(/afs/cmd)--> afs_sim_node --(/scan,/odom,/afs/articulation)--> THIS
+    THIS --(/afs/cmd)--> afs_sim_node --(/map,/odom,/afs/articulation)--> THIS
 
 ------------------------------------------------------------------- INPUT
 Right handle joystick (2 axes): one axis drives forward/back (-> v_f), the other
@@ -21,10 +23,11 @@ because the Ponsse handle is not a standard gamepad -- verify with
 A button toggles the CBF assist (set `assist_button`, -1 to disable).
 
 ------------------------------------------------------------------ INTERFACE
-Subscribes: /right_controller/joy (sensor_msgs/Joy), /scan (LaserScan),
+Subscribes: /right_controller/joy (sensor_msgs/Joy), /map (OccupancyGrid,
+            received once from the sim -- latched via TRANSIENT_LOCAL QoS),
             /odom (Odometry), /afs/articulation (Float64)
 Publishes:  /afs/cmd (Float64MultiArray [v_f, omega]),
-            /afs/ogm (nav_msgs/OccupancyGrid, the built map for RViz)
+            /afs/ogm (nav_msgs/OccupancyGrid, the map echoed back for RViz)
 """
 import math
 import numpy as np
@@ -33,48 +36,48 @@ from scipy.optimize import minimize
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 from std_msgs.msg import Float64, Float64MultiArray
-from sensor_msgs.msg import LaserScan, Joy
+from sensor_msgs.msg import Joy
 from nav_msgs.msg import Odometry, OccupancyGrid
 
 
 # --------------------------------------------------------------------------- #
-# Occupancy grid built from observed /scan                                    #
+# Static occupancy grid, received once from /map                              #
 # --------------------------------------------------------------------------- #
-class LocalOGM:
-    def __init__(self, width, height, res, origin=(0.0, 0.0)):
-        self.res = res
-        self.origin = np.array(origin, float)
-        self.nx, self.ny = int(round(width / res)), int(round(height / res))
-        self.logodds = np.zeros((self.ny, self.nx))
-        self.L_OCC, self.L_FREE, self.L_CLAMP = 0.85, -0.40, 6.0
+class StaticOGM:
+    """Wraps a nav_msgs/OccupancyGrid message with the small interface
+    afs_constraints() below expects (prob(), world_to_cell(), res, origin,
+    nx, ny). Populated once when the static map arrives -- there is no
+    incremental update step any more."""
+
+    def __init__(self):
+        self.res = None
+        self.origin = None
+        self.nx = self.ny = 0
+        self._prob = None
+        self._known = None
+
+    def ready(self):
+        return self._prob is not None
+
+    def load_from_msg(self, msg):
+        self.res = float(msg.info.resolution)
+        self.origin = np.array([msg.info.origin.position.x, msg.info.origin.position.y], float)
+        self.nx, self.ny = msg.info.width, msg.info.height
+        data = np.array(msg.data, dtype=np.int16).reshape((self.ny, self.nx))
+        self._known = data >= 0
+        self._prob = np.where(self._known, data / 100.0, 0.0)
+
+    def prob(self):
+        return self._prob
+
+    def known(self):
+        return self._known
 
     def world_to_cell(self, p):
         c = ((np.asarray(p) - self.origin) / self.res).astype(int)
         return int(c[0]), int(c[1])
-
-    def prob(self):
-        return 1.0 - 1.0 / (1.0 + np.exp(self.logodds))
-
-    def update_from_scan(self, sx, sy, syaw, rel_angles, ranges, range_max):
-        step = self.res * 0.5
-        n_steps = max(1, int(range_max / step))
-        abs_ang = syaw + np.asarray(rel_angles)
-        dirs = np.stack([np.cos(abs_ang), np.sin(abs_ang)], axis=1)
-        s = np.arange(1, n_steps + 1) * step
-        pts = np.array([sx, sy])[None, None, :] + s[None, :, None] * dirs[:, None, :]
-        ix = ((pts[..., 0] - self.origin[0]) / self.res).astype(np.intp)
-        iy = ((pts[..., 1] - self.origin[1]) / self.res).astype(np.intp)
-        inb = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
-        r = np.asarray(ranges, float)
-        free_mask = (s[None, :] < (r[:, None] - self.res)) & inb
-        hit = r < (range_max - 1e-3)
-        hit_step = np.clip((r / step).astype(np.intp) - 1, 0, n_steps - 1)
-        hit_mask = hit[:, None] & (np.arange(n_steps)[None, :] == hit_step[:, None]) & inb
-        np.add.at(self.logodds, (iy[free_mask], ix[free_mask]), self.L_FREE)
-        np.add.at(self.logodds, (iy[hit_mask], ix[hit_mask]), self.L_OCC)
-        np.clip(self.logodds, -self.L_CLAMP, self.L_CLAMP, out=self.logodds)
 
 
 # --------------------------------------------------------------------------- #
@@ -184,10 +187,6 @@ class AFSControllerNode(Node):
         self.k_glim = p("gamma_limit_gain", 2.0).value
         self.influence_R = p("influence_radius", 1.0).value
         self.ctrl_rate = p("control_rate", 30.0).value
-        ow = p("ogm_width", 12.0).value
-        oh = p("ogm_height", 8.0).value
-        ores = p("ogm_res", 0.06).value
-        oorigin = p("ogm_origin", [0.0, 0.0]).value
         # --- joystick mapping (right Ponsse handle) ---
         self.joy_topic = p("joy_topic", "/right_controller/joy").value
         self.axis_drive = p("axis_drive", 0).value       # forward/back axis index
@@ -196,32 +195,40 @@ class AFSControllerNode(Node):
         self.invert_steer = p("invert_steer", True).value
         self.deadzone = p("deadzone", 0.06).value
         self.assist_button = p("assist_button", 0).value # -1 to disable
+        self.assist_default = p("assist_default", True).value
         self.joy_timeout = p("joy_timeout", 0.5).value   # s; zero cmd if joy stale
+        self.map_topic = p("map_topic", "/map").value
 
         self.veh = AFSVehicle(self.L_f, self.L_r, self.r_disc)
-        self.ogm = LocalOGM(ow, oh, ores, oorigin)
+        self.ogm = StaticOGM()
+        self._map_msg = None
 
         self.state = None
         self.pose = None
         self.gamma = 0.0
         self.v_cmd = 0.0
         self.omega_cmd = 0.0
-        self.assist = True
+        self.assist = bool(self.assist_default)
         self._prev_btn = 0
         self._last_joy = None
 
         self.pub = self.create_publisher(Float64MultiArray, "afs/cmd", 10)
         self.pub_map = self.create_publisher(OccupancyGrid, "afs/ogm", 1)
         self.create_subscription(Joy, self.joy_topic, self.joy_cb, 10)
-        self.create_subscription(LaserScan, "scan", self.scan_cb, qos_profile_sensor_data)
+        map_qos = QoSProfile(depth=1, history=QoSHistoryPolicy.KEEP_LAST,
+                             reliability=QoSReliabilityPolicy.RELIABLE,
+                             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(OccupancyGrid, self.map_topic, self.map_cb, map_qos)
         self.create_subscription(Odometry, "odom", self.odom_cb, 10)
         self.create_subscription(Float64, "afs/articulation", self.art_cb, 10)
 
         self.create_timer(1.0 / self.ctrl_rate, self.control_tick)
-        self.create_timer(0.2, self.publish_map)
+        self.create_timer(0.5, self.publish_map)
         self.get_logger().info(
             f"AFS controller ready. Driving from {self.joy_topic} "
-            f"(axis_drive={self.axis_drive}, axis_steer={self.axis_steer}). assist=ON")
+            f"(axis_drive={self.axis_drive}, axis_steer={self.axis_steer}). "
+            f"Waiting for static map on {self.map_topic}. "
+            f"assist={'ON' if self.assist else 'OFF (manual)'}")
 
     # ------------------------------------------------------------------ inputs
     def _dz(self, x):
@@ -244,6 +251,15 @@ class AFSControllerNode(Node):
                 self.get_logger().info(f"assist {'ON' if self.assist else 'OFF'}")
             self._prev_btn = b
 
+    def map_cb(self, msg: OccupancyGrid):
+        first = not self.ogm.ready()
+        self.ogm.load_from_msg(msg)
+        self._map_msg = msg
+        if first:
+            self.get_logger().info(
+                f"Static map received: {msg.info.width}x{msg.info.height} "
+                f"@ {msg.info.resolution} m/cell")
+
     def odom_cb(self, msg: Odometry):
         self.pose = (msg.pose.pose.position.x, msg.pose.pose.position.y,
                      quat_to_yaw(msg.pose.pose.orientation.z, msg.pose.pose.orientation.w))
@@ -257,18 +273,9 @@ class AFSControllerNode(Node):
         if self.pose is not None:
             self.state = np.array([self.pose[0], self.pose[1], self.pose[2], self.gamma])
 
-    def scan_cb(self, msg: LaserScan):
-        if self.state is None:
-            return
-        xf, yf, th_f, g = self.state          # FRONT model: LIDAR at the state position
-        rel = msg.angle_min + np.arange(len(msg.ranges)) * msg.angle_increment
-        ranges = np.asarray(msg.ranges, float)
-        ranges = np.where(np.isfinite(ranges), ranges, msg.range_max)
-        self.ogm.update_from_scan(xf, yf, th_f, rel, ranges, msg.range_max)
-
     # ----------------------------------------------------------------- control
     def control_tick(self):
-        if self.state is None:
+        if self.state is None or not self.ogm.ready():
             return
         # watchdog: stop if the joystick stream went stale
         if self._last_joy is None or \
@@ -287,21 +294,12 @@ class AFSControllerNode(Node):
         self.pub.publish(Float64MultiArray(data=[float(z[0]), float(z[1])]))
 
     def publish_map(self):
-        prob = self.ogm.prob()
-        data = np.full(prob.shape, -1, dtype=np.int8)
-        known = np.abs(self.ogm.logodds) > 1e-6
-        data[known] = (prob[known] * 100).astype(np.int8)
-        msg = OccupancyGrid()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "odom"
-        msg.info.resolution = float(self.ogm.res)
-        msg.info.width = self.ogm.nx
-        msg.info.height = self.ogm.ny
-        msg.info.origin.position.x = float(self.ogm.origin[0])
-        msg.info.origin.position.y = float(self.ogm.origin[1])
-        msg.info.origin.orientation.w = 1.0
-        msg.data = data.flatten().tolist()
-        self.pub_map.publish(msg)
+        # Echo the static map back out on afs/ogm so existing RViz configs that
+        # point at it keep working; the map itself never changes after receipt.
+        if self._map_msg is None:
+            return
+        self._map_msg.header.stamp = self.get_clock().now().to_msg()
+        self.pub_map.publish(self._map_msg)
 
 
 def main(args=None):

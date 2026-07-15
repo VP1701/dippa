@@ -8,12 +8,22 @@ CBF/MPC assist still applies -- this does NOT bypass it).
 
   w / s : drive forward / reverse
   a / d : steer left / right
+  c     : toggle CBF/MPC assist on/off (same as a gamepad's assist_button --
+          useful for A/B testing whether the safety filter is doing anything:
+          drive the same line with assist on, then off, and compare)
   space : stop immediately
   q     : quit
 
 Hold a key to keep moving; release and it coasts to a stop. Must run in a
 terminal with keyboard focus (the launch file opens one via `xterm -e`), so it
 does not interfere with RViz.
+
+If you want a TOTAL bypass of the controller/CBF/MPC (not just toggling the
+assist flag inside it), skip this node and the shared controller entirely and
+drive the sim directly via /cmd_vel instead, e.g.:
+    ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/cmd_vel
+The sim listens to /cmd_vel independently of /afs/cmd, with no safety filter
+in that path at all. See `manual:=true` in the launch file.
 
 Notes:
 - `decay_timeout` (0.6 s) is set above the OS key-repeat *initial delay* so that
@@ -36,6 +46,7 @@ HELP = """
   w / s : drive forward / reverse
   a / d : steer left / right
   space : stop      q : quit
+  c     : toggle CBF/MPC assist on/off
   (type in THIS window; hold to move)
 ================================================
 """
@@ -48,10 +59,12 @@ class KeyboardTeleop(Node):
         self.declare_parameter('rate', 50.0)
         self.declare_parameter('decay_timeout', 0.2)   # s without a key -> ramp to 0
         self.declare_parameter('ramp', 3.0)            # axis units / s toward target
+        self.declare_parameter('assist_button', 0)     # which Joy.buttons[] slot to pulse
         topic = self.get_parameter('topic').value
         self.rate = float(self.get_parameter('rate').value)
         self.decay = float(self.get_parameter('decay_timeout').value)
         self.ramp = float(self.get_parameter('ramp').value)
+        self.assist_button = int(self.get_parameter('assist_button').value)
 
         self.pub = self.create_publisher(Joy, topic, 10)
         self.drive = 0.0   # current (ramped) output
@@ -59,6 +72,7 @@ class KeyboardTeleop(Node):
         self.t_drive = 0.0  # target from last key
         self.t_steer = 0.0
         self.last_key = 0.0
+        self.toggle_pending = False   # 'c' pressed since last tick -> pulse the button once
         self.lock = threading.Lock()
         self.alive = True
 
@@ -91,6 +105,8 @@ class KeyboardTeleop(Node):
                     elif c in (' ', 'x'):
                         self.t_drive = 0.0
                         self.t_steer = 0.0
+                    elif c == 'c':
+                        self.toggle_pending = True
                     elif c in ('q', '\x03'):   # q or Ctrl-C
                         self.alive = False
         finally:
@@ -104,13 +120,21 @@ class KeyboardTeleop(Node):
                 self.t_drive = 0.0
                 self.t_steer = 0.0
             td, ts = self.t_drive, self.t_steer
+            pulse = self.toggle_pending
+            self.toggle_pending = False
         step = self.ramp / self.rate
         self.drive += max(-step, min(step, td - self.drive))
         self.steer += max(-step, min(step, ts - self.steer))
         msg = Joy()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.axes = [float(self.steer), float(self.drive)]   # [steer, drive]
-        msg.buttons = []
+        # buttons[] sized so assist_button is always a valid index; pulse it
+        # high for exactly one publish so the controller sees a rising edge.
+        nbtn = max(1, self.assist_button + 1)
+        msg.buttons = [0] * nbtn
+        if pulse:
+            msg.buttons[self.assist_button] = 1
+            self.get_logger().info("assist toggle key pressed")
         self.pub.publish(msg)
 
 

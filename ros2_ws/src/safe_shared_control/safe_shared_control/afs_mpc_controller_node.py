@@ -79,7 +79,7 @@ class AFSModel:
         self.A_k[1,2] = self.dt * v_f * cos_theta_f
         num = v_f * self.L_f + self.L_f * self.L_r * omega * sin_gamma + self.L_r * v_f * np.cos(gamma)
         den = (term1) ** 2
-        self.A_k[2,3] = num/den
+        self.A_k[2,3] = self.dt * num / den
 
         # calculating B_k
         self.B_k[0,0] = self.dt * cos_theta_f
@@ -135,7 +135,7 @@ class AFSModel:
         return disc_coordinates
 
 
-    def disc_jacobian(self, q):
+    def disc_jacobians(self, q):
         """J_i = d p_i / d q  (2x4) per disc, evaluated at q.
         
         Args:
@@ -189,7 +189,7 @@ class AFSMPC:
         self.H = H
         self.dt =  model.dt
           
-
+        self.alpha = float(np.clip(gamma_cbf * self.dt, 1e-3, 1.0))
         self.margin = margin
         self.influence_R = influence_R
         self.Qu = np.array([q_v, q_w]); self.R = np.array([r_v, r_w])
@@ -206,6 +206,10 @@ class AFSMPC:
         self._useq_prev = None
         self._u_user_prev = None
 
+    # --- index helpers into Z ---
+    def iq(self, k):  return 6 * (k - 1)            # q~_k start (k=1..H)
+    def idu(self, k): return 6 * self.H + 2 * k     # du_k start (k=0..H-1)
+    def ieps(self, k): return 8 * self.H + (k - 1)  # eps_k      (k=1..H)
 
     def _linearize_over_horizon(self, qbar, u_seq):
         """ Linearizes the LTV system per timestep
@@ -305,7 +309,7 @@ class AFSMPC:
         linearized = []
 
         for k, result in enumerate(results):
-            if results is None:
+            if result is None:
                 linearized.append(None)
                 continue
 
@@ -318,58 +322,340 @@ class AFSMPC:
 
         return linearized
 
-    # --- index helpers into Z ---
-    def iq(self, k):  return 6 * (k - 1)            # q~_k start (k=1..H)
-    def idu(self, k): return 6 * self.H + 2 * k     # du_k start (k=0..H-1)
-    def ieps(self, k): return 8 * self.H + (k - 1)  # eps_k      (k=1..H)
+    def _obstacle_rows(self, linearized, q0, rows, cols, data, lo, up, r):
+        
+        for k in range(self.H):
+            if linearized[k] is None or linearized[k + 1] is None:
+                continue
+            
+            a_k, b_k = linearized[k]
+            a_k_next, b_k_next = linearized[k + 1]
+
+            iq_k_next = self.iq(k + 1)
+
+            for b in range(4):
+                rows.append(r)
+                cols.append(iq_k_next + b)
+                data.append(a_k_next[b])
+
+            rows.append(r)
+            cols.append(self.ieps(k + 1))
+            data.append(1.0)
+
+            if k == 0:
+                lo.append((1 - self.alpha)*(a_k @ q0 + b_k) - b_k_next)
+            else:
+                iq_k = self.iq(k)
+                for b in range(4):
+                    rows.append(r) #
+                    cols.append(iq_k + b)
+                    data.append(-(1 - self.alpha) * a_k[b])
+                lo.append((1 - self.alpha)*b_k - b_k_next)
+            
+            up.append(np.inf)
+            r += 1
+
+        return r
+
+    def _obstacle_constraint_rows(self, qbar, clusters, q0, rows, cols,
+                                  data, lo, up, r):
+        """ Appends obstacle constraint rows for every collsiion disc
+        agains every obstacle cluster
+        
+        
+        
+        """     
+
+        num_steps = self.H + 1
+        num_discs = len(self.model.discs)
+
+        # Get position and jacobian for each disc over the whole horizon
+        position_at_step = []
+        jacobian_at_step = [] 
+        for k in range(num_steps):
+            position_at_step.append(self.model.disc_cords(qbar[k]))
+            jacobian_at_step.append(self.model.disc_jacobians(qbar[k])) 
+
+
+        # Get position and jacobian for a disc over the whole horizon
+        for disc_index in range(num_discs):
+            disc_positions = []
+            disc_jacobians = []
+
+            for k in range(num_steps):
+                disc_positions.append(position_at_step[k][disc_index])
+                disc_jacobians.append(jacobian_at_step[k][disc_index])
+            disc_positions = np.array(disc_positions)
+
+            # build obstacle row for disc against cluster
+            for cluster in clusters:
+                horizon = self._disc_cluster_horizon(disc_positions, cluster)
+
+                linearized_obstacle = self._linearize_disc_cluster_horizon(
+                disc_positions, qbar, disc_jacobians, horizon)
+
+                r = self._obstacle_rows(linearized_obstacle, q0, rows, cols, data,
+                                        lo, up, r)
+
+        return r
+
+
+    def _dynamics_rows(self, q0, u_prev, A_list, B_list, c_list, rows, cols,
+                    data, lo, up, r):
+        q_aug_0 = np.concatenate([q0, u_prev])
+
+        for k in range(self.H):
+            A_k = A_list[k]
+            B_k = B_list[k]
+            c_k = c_list[k]
+
+            iq_k_next = self.iq(k + 1)
+            idu_k = self.idu(k)
+
+            # q~_{k+1} block: identity coefficients, one row per component.
+            for row in range(6):
+                rows.append(r + row)
+                cols.append(iq_k_next + row)
+                data.append(1.0)
+
+            # -B_k @ du_k block: each of the 6 rows gets 2 column entries.
+            for row in range(6):
+                for col in range(2):
+                    rows.append(r + row)
+                    cols.append(idu_k + col)
+                    data.append(-B_k[row, col])
+
+            if k == 0:
+                # q~_0 is known, not a variable: fold A_k @ q~_0 into rhs.
+                rhs = A_k @ q_aug_0 + c_k
+            else:
+                # q~_k block: -A_k coefficients, 6x6 entries.
+                iq_k = self.iq(k)
+                for row in range(6):
+                    for col in range(6):
+                        rows.append(r + row)
+                        cols.append(iq_k + col)
+                        data.append(-A_k[row, col])
+                rhs = c_k
+
+            # Equality: lo == up == rhs, one value per row.
+            for row in range(6):
+                lo.append(rhs[row])
+                up.append(rhs[row])
+
+            r += 6
+
+        return r
+
+
+    def _box_rows(self, rows, cols, data, lo, up, r):
+        """Appends actuator/state-limit and slack-nonnegativity rows.
+
+        - |v| <= v_max, |omega| <= omega_max, for u_k (k = 0..H-1)
+        - |gamma| <= g_max, for q_k's gamma component (k = 1..H)
+        - eps_k >= 0 (k = 1..H)
+
+        Args:
+            rows, cols, data, lo, up: shared sparse-triplet lists to
+                append to (mutated in place).
+            r: int, next free row index.
+
+        Returns:
+            r: updated next free row index.
+        """
+        # Input limits: u_k lives in q~_{k+1}'s trailing 2 components.
+        for k in range(self.H):
+            iu = self.iq(k + 1) + 4
+            rows.append(r); cols.append(iu); data.append(1.0)
+            lo.append(-self.v_max); up.append(self.v_max)
+            r += 1
+
+            rows.append(r); cols.append(iu + 1); data.append(1.0)
+            lo.append(-self.omega_max); up.append(self.omega_max)
+            r += 1
+
+        # Articulation limit: gamma is q_k's 4th component.
+        for k in range(1, self.H + 1):
+            i_gamma = self.iq(k) + 3
+            rows.append(r); cols.append(i_gamma); data.append(1.0)
+            lo.append(-self.g_max); up.append(self.g_max)
+            r += 1
+
+        # Slack non-negativity.
+        for k in range(1, self.H + 1):
+            rows.append(r); cols.append(self.ieps(k)); data.append(1.0)
+            lo.append(0.0); up.append(np.inf)
+            r += 1
+
+        return r
+
 
     def min_clearance(self, q, clusters):
-        """Smallest disc clearance h = dist - r_disc - margin at pose q (h<0 => in keep-out)."""
+        """Smallest disc clearance across all discs and obstacle clusters,
+        at a single pose q (h < 0 means a disc is already in the keep-out).
+
+        Args:
+            q: array (4,), a single state (not a horizon).
+            clusters: list of obstacle point clusters, each an (N, 2) array.
+
+        Returns:
+            hmin: float, the smallest clearance found (np.inf if no cluster
+            is within influence range of any disc).
+        """
+        disc_positions = self.model.disc_cords(q)
         hmin = np.inf
-        for p in self.m.disc_pos(q):
-            for wpts in clusters:
-                dmin = float(np.sqrt(((p[None, :] - wpts) ** 2).sum(1)).min())
-                hmin = min(hmin, dmin - self.m.r_disc - self.margin)
+        for disc_position in disc_positions:
+            for cluster in clusters:
+                result = self._disc_cluster_distance(disc_position, cluster)
+                if result is None:
+                    continue
+                _, _, h = result
+                hmin = min(hmin, h)
         return float(hmin)
 
+
+    def _build_cost(self, u_user):
+        """Builds the diagonal quadratic cost P and linear cost qv for the QP.
+
+        Args:
+            u_user: array (2,), the driver's held command [v, omega].
+
+        Returns:
+            P: sparse (nz, nz) diagonal cost matrix.
+            qv: array (nz,), linear cost vector.
+        """
+        Pd = np.full(self.nz, 1e-6)   # tiny regularization on every variable
+        qv = np.zeros(self.nz)
+
+        # Tracking cost: penalize u_k (in q~_{k+1}) deviating from u_user.
+        for k in range(self.H):
+            iu = self.iq(k + 1) + 4
+            Pd[iu] += 2 * self.Qu[0]
+            qv[iu] += -2 * self.Qu[0] * u_user[0]
+            Pd[iu + 1] += 2 * self.Qu[1]
+            qv[iu + 1] += -2 * self.Qu[1] * u_user[1]
+
+        # Smoothness cost: penalize du_k.
+        for k in range(self.H):
+            idu = self.idu(k)
+            Pd[idu] += 2 * self.R[0]
+            Pd[idu + 1] += 2 * self.R[1]
+
+        # Terminal cost: soft penalty on terminal speed v_f.
+        Pd[self.iq(self.H) + 4] += 2 * self.w_term
+
+        # Slack cost: quadratic + linear exact-penalty term.
+        for k in range(1, self.H + 1):
+            Pd[self.ieps(k)] += 2 * self.w_slack
+            qv[self.ieps(k)] += self.w_slack_lin
+
+        P = sparse.diags(Pd).tocsc()
+        return P, qv
+
+
+    def _assemble_and_solve(self, P, qv, rows, cols, data, lo, up, x_ws):
+        """Builds the sparse constraint matrix, solves the QP, and returns
+        the solution.
+
+        Args:
+            P: sparse (nz, nz) diagonal cost matrix, from _build_cost.
+            qv: array (nz,), linear cost vector, from _build_cost.
+            rows, cols, data: sparse-triplet entries for the constraint
+                matrix Ac, accumulated by the row-builder methods.
+            lo, up: lists of lower/upper bounds, one per constraint row.
+            x_ws: array (nz,) or None, warm-start guess for the primal
+                solution.
+
+        Returns:
+            x: array (nz,), the solution, or None if the solve failed.
+            ok: bool, whether the solve succeeded.
+        """
+        num_rows = len(lo)
+        Ac = sparse.csc_matrix((data, (rows, cols)), shape=(num_rows, self.nz))
+
+        prob = osqp.OSQP()
+        prob.setup(P=P, q=qv, A=Ac, l=np.array(lo), u=np.array(up),
+                verbose=False, warm_starting=True, max_iter=8000,
+                eps_abs=1e-4, eps_rel=1e-4, polish=True)
+
+        if x_ws is not None and len(x_ws) == self.nz:
+            try:
+                prob.warm_start(x=x_ws)
+            except Exception:
+                pass
+
+        res = prob.solve()
+        ok = (res.info.status_val in (1, 2)
+            and res.x is not None
+            and np.all(np.isfinite(res.x)))
+        return (res.x if ok else None), ok
+
     def solve(self, q0, u_prev, u_user, clusters):
-        H, dt = self.H, self.dt
-        q0 = np.asarray(q0, float); u_prev = np.asarray(u_prev, float)
+        """Solves the CBF-MPC QP for one control tick.
+
+        Args:
+            q0: array (4,), current state.
+            u_prev: array (2,), previously applied input.
+            u_user: array (2,), driver's held command [v, omega].
+            clusters: list of obstacle point clusters, each an (N, 2) array.
+
+        Returns:
+            u0: array (2,), the command to apply now.
+            planned: list of H+1 states, the MPC's planned trajectory
+                (None if the solve failed).
+            qbar: list of H+1 states, the last nonlinear nominal used.
+            ok: bool, whether a feasible solve was found.
+            info: dict with diagnostic fields (min_h_now, slack_now,
+                slack_max, infeasible, solver_failed).
+        """
+        q0 = np.asarray(q0, float)
+        u_prev = np.asarray(u_prev, float)
         u_user = np.asarray(u_user, float)
-        # Warm-start the SQP nominal from the previous plan for fast, stable
-        # convergence and a committed avoidance direction -- EXCEPT when the
-        # driver's intent flips (forward<->reverse or a large command jump),
-        # where the stale plan makes the controller sticky and it crawls toward
-        # the new command. On a flip we reseed the nominal from the held command
-        # so the new intent takes effect immediately.
+
+        # Warm-start the nominal input sequence, unless the driver's intent
+        # just flipped (forward<->reverse or a large command jump), in which
+        # case we reseed from the held command so the new intent takes
+        # effect immediately instead of crawling out of the stale plan.
         prev = self._u_user_prev
         flip = (prev is None
                 or u_user[0] * prev[0] < -0.05
                 or np.linalg.norm(u_user - prev) > self.intent_reset_thresh)
-        if (self._useq_prev is not None) and (not flip):
+        if self._useq_prev is not None and not flip:
             u_seq = np.vstack([self._useq_prev[1:], self._useq_prev[-1:]])
         else:
-            u_seq = np.tile(u_user, (H, 1))
+            u_seq = np.tile(u_user, (self.H, 1))
         self._u_user_prev = np.array(u_user, float)
+
         x_ws = self.x_prev
+        P, qv = self._build_cost(u_user)
         best = None
+        qbar = None
+
         for _ in range(self.sqp_iters):
-            qbar = [q0]
-            for k in range(H):
-                qbar.append(self.m.f(qbar[k], u_seq[k], dt))      # nonlinear nominal
-            A_incremental_list, B_incremental_list, c_incremental_list = [], [], []
-            for k in range(H):                                    # per-step (LTV)
-                A, B, c = self.m.linearize(qbar[k], u_seq[k], dt)
-                A_incremental_list.append(np.block([[A, B], [np.zeros((2, 4)), np.eye(2)]]))
-                B_incremental_list.append(np.vstack([B, np.eye(2)]))
-                c_incremental_list.append(np.concatenate([c, np.zeros(2)]))
-            x, ok = self._qp(q0, u_prev, u_user, qbar, A_incremental_list, B_incremental_list, c_incremental_list, clusters, x_ws)
+            qbar = self._nominal_trajectory(q0, u_seq)
+            A_list, B_list, c_list = self._linearize_over_horizon(qbar, u_seq)
+
+            rows, cols, data, lo, up = [], [], [], [], []
+            r = 0
+            r = self._dynamics_rows(q0, u_prev, A_list, B_list, c_list,
+                                    rows, cols, data, lo, up, r)
+            r = self._obstacle_constraint_rows(qbar, clusters, q0, rows, cols,
+                                                data, lo, up, r)
+            r = self._box_rows(rows, cols, data, lo, up, r)
+
+            x, ok = self._assemble_and_solve(P, qv, rows, cols, data, lo, up,
+                                            x_ws)
             if not ok:
                 break
+
             x_ws = x
-            u_seq = np.array([x[self.iq(k + 1) + 4:self.iq(k + 1) + 6] for k in range(H)])
-            planned = [q0] + [x[self.iq(k):self.iq(k) + 4] for k in range(1, H + 1)]
-            best = (u_prev + x[self.idu(0):self.idu(0) + 2], planned, list(qbar), x, u_seq)
+            u_seq = np.array([x[self.iq(k + 1) + 4:self.iq(k + 1) + 6]
+                            for k in range(self.H)])
+            planned = [q0] + [x[self.iq(k):self.iq(k) + 4]
+                            for k in range(1, self.H + 1)]
+            best = (u_prev + x[self.idu(0):self.idu(0) + 2], planned,
+                    list(qbar), x, u_seq)
+
         if best is None:
             # SAFE FALLBACK: a failed/maxed-out solve must NOT hold the last
             # (possibly forward) command -- that would drive through a wall.
@@ -379,8 +665,10 @@ class AFSMPC:
                     'slack_now': float('inf'), 'slack_max': float('inf'),
                     'infeasible': True, 'solver_failed': True}
             return np.zeros(2), None, [q0], False, info
+
         u0, planned, qbar, x, u_seq = best
-        self.x_prev = x; self._useq_prev = u_seq
+        self.x_prev = x
+        self._useq_prev = u_seq
         slack_now = float(x[self.ieps(1)]) if self.H >= 1 else 0.0
         slack_max = float(max(x[self.ieps(k)] for k in range(1, self.H + 1)))
         info = {'min_h_now': self.min_clearance(q0, clusters),
@@ -388,89 +676,13 @@ class AFSMPC:
                 'infeasible': slack_now > self.eps_tol, 'solver_failed': False}
         return u0, planned, qbar, True, info
 
-    def _qp(self, q0, u_prev, u_user, qbar, A_incremental_list, B_incremental_list, c_incremental_list, clusters, x_ws):
-        H, dt, nz = self.H, self.dt, self.nz
-        qt0 = np.concatenate([q0, u_prev])
-        # ---- cost (diagonal P, linear q) ----
-        Pd = np.full(nz, 1e-6); qv = np.zeros(nz)
-        for k in range(H):
-            iu = self.iq(k + 1) + 4
-            Pd[iu] += 2 * self.Qu[0]; qv[iu] += -2 * self.Qu[0] * u_user[0]
-            Pd[iu + 1] += 2 * self.Qu[1]; qv[iu + 1] += -2 * self.Qu[1] * u_user[1]
-        for k in range(H):
-            idu = self.idu(k); Pd[idu] += 2 * self.R[0]; Pd[idu + 1] += 2 * self.R[1]
-        Pd[self.iq(H) + 4] += 2 * self.w_term
-        for k in range(1, H + 1):
-            Pd[self.ieps(k)] += 2 * self.w_slack
-            qv[self.ieps(k)] += self.w_slack_lin     # exact-penalty term: don't cut the margin cheaply
-        P = sparse.diags(Pd).tocsc()
-        rows, cols, data, lo, up = [], [], [], [], []
-        r = 0
-        def add(rr, cc, vv): rows.append(rr); cols.append(cc); data.append(vv)
-        # dynamics equalities (per-step matrices)
-        for k in range(H):
-            iqp = self.iq(k + 1); idu = self.idu(k); At, Bt, ct = A_incremental_list[k], B_incremental_list[k], c_incremental_list[k]
-            for a in range(6):
-                add(r + a, iqp + a, 1.0)
-                for b in range(2): add(r + a, idu + b, -Bt[a, b])
-            if k == 0:
-                rhs = At @ qt0 + ct
-            else:
-                iqk = self.iq(k)
-                for a in range(6):
-                    for b in range(6): add(r + a, iqk + b, -At[a, b])
-                rhs = ct
-            for a in range(6): lo.append(rhs[a]); up.append(rhs[a])
-            r += 6
-        # obstacle CBF-rate (per disc, per cluster)
-        Pn = [self.m.disc_pos(qbar[k]) for k in range(H + 1)]
-        Jn = [self.m.disc_jacobian(qbar[k]) for k in range(H + 1)]
-        aa = 1.0 - self.alpha
-        for i in range(len(self.m.discs)):
-            pi = np.array([Pn[k][i] for k in range(H + 1)])
-            for wpts in clusters:
-                d2 = ((pi[:, None, :] - wpts[None, :, :]) ** 2).sum(-1)
-                kb = d2.argmin(1); cpts = wpts[kb]          # single closest cell
-                dist = np.sqrt(d2[np.arange(H + 1), kb])
-                if dist.min() > self.influence_R:
-                    continue
-                diff = pi - cpts
-                nrm = diff / np.clip(dist[:, None], 1e-9, None)
-                hbar = dist - self.m.r_disc - self.margin
-                avec = np.array([nrm[k] @ Jn[k][i] for k in range(H + 1)])
-                bk = hbar - np.array([avec[k] @ qbar[k] for k in range(H + 1)])
-                for k in range(H):
-                    iqp = self.iq(k + 1)
-                    for b in range(4): add(r, iqp + b, avec[k + 1][b])
-                    add(r, self.ieps(k + 1), 1.0)
-                    if k == 0:
-                        l = aa * hbar[0] - bk[1]
-                    else:
-                        iqk = self.iq(k)
-                        for b in range(4): add(r, iqk + b, -aa * avec[k][b])
-                        l = aa * bk[k] - bk[k + 1]
-                    lo.append(l); up.append(np.inf); r += 1
-        # box constraints
-        for k in range(H):
-            iu = self.iq(k + 1) + 4
-            add(r, iu, 1.0); lo.append(-self.v_max); up.append(self.v_max); r += 1
-            add(r, iu + 1, 1.0); lo.append(-self.omega_max); up.append(self.omega_max); r += 1
-        for k in range(1, H + 1):
-            add(r, self.iq(k) + 3, 1.0); lo.append(-self.g_max); up.append(self.g_max); r += 1
-        for k in range(1, H + 1):
-            add(r, self.ieps(k), 1.0); lo.append(0.0); up.append(np.inf); r += 1
-        Ac = sparse.csc_matrix((data, (rows, cols)), shape=(r, nz))
-        prob = osqp.OSQP()
-        prob.setup(P=P, q=qv, A=Ac, l=np.array(lo), u=np.array(up), verbose=False,
-                   warm_starting=True, max_iter=8000, eps_abs=1e-4, eps_rel=1e-4,
-                   polish=True)
-        if x_ws is not None and len(x_ws) == nz:
-            try: prob.warm_start(x=x_ws)
-            except Exception: pass
-        res = prob.solve()
-        ok = res.info.status_val in (1, 2) and res.x is not None and np.all(np.isfinite(res.x))
-        return (res.x if ok else None), ok
 
+
+
+
+
+
+    
 
 def clip_halfplane(poly, n, d):
     """Clip convex polygon (list of (x,y)) to the half-plane n.x >= d."""
@@ -619,7 +831,7 @@ def main(args=None):
             # Set collision disc coordinates
             discs = [(self.L_f, 0), (-self.L_r, 0)]
             self.model = AFSModel(self.L_f, self.L_r, self.r_disc, discs, self.dt)
-            self.mpc = AFSMPC(self.model, H=self.H, dt=self.dt, gamma_cbf=self.gamma_cbf,
+            self.mpc = AFSMPC(self.model, H=self.H, gamma_cbf=self.gamma_cbf,
                               margin=self.margin, influence_R=self.influence_R,
                               q_v=self.q_v, q_w=self.q_w, r_v=self.r_v, r_w=self.r_w,
                               w_term=self.w_term, w_slack=self.w_slack,
@@ -711,7 +923,7 @@ def main(args=None):
             # intent = nonlinear rollout of the *held user command* (unaided path)
             intent = [self.state]
             for _ in range(self.H):
-                intent.append(self.model.f(intent[-1], u_user, self.dt))
+                intent.append(self.model.f(intent[-1], u_user))
             self._publish_path(self.pub_intent, intent)
 
             if not self.assist:
@@ -775,7 +987,7 @@ def main(args=None):
             i = int(self.viz_disc)
             H = len(traj)
             for k, q in enumerate(traj):
-                p = self.model.disc_pos(q)[i]
+                p = self.model.disc_cords(q)[i]
                 poly = [(p[0] - R, p[1] - R), (p[0] + R, p[1] - R),
                         (p[0] + R, p[1] + R), (p[0] - R, p[1] + R)]
                 for wpts in clusters:
