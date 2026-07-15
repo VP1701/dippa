@@ -448,7 +448,7 @@ class AFSMPC:
         return r
 
 
-    def _box_rows(self, rows, cols, data, lo, up, r):
+    def _box_rows(self, u_user, rows, cols, data, lo, up, r):
         """Appends actuator/state-limit and slack-nonnegativity rows.
 
         - |v| <= v_max, |omega| <= omega_max, for u_k (k = 0..H-1)
@@ -463,6 +463,14 @@ class AFSMPC:
         Returns:
             r: updated next free row index.
         """
+        omega_deadzone = 1e-3  
+        if u_user[1] > omega_deadzone:
+            omega_lo, omega_hi = 0.0, self.omega_max
+        elif u_user[1] < -omega_deadzone:
+            omega_lo, omega_hi = -self.omega_max, 0.0
+        else:
+            omega_lo, omega_hi = 0.0, 0.0
+
         # Input limits: u_k lives in q~_{k+1}'s trailing 2 components.
         for k in range(self.H):
             iu = self.iq(k + 1) + 4
@@ -471,7 +479,7 @@ class AFSMPC:
             r += 1
 
             rows.append(r); cols.append(iu + 1); data.append(1.0)
-            lo.append(-self.omega_max); up.append(self.omega_max)
+            lo.append(omega_lo); up.append(omega_hi)
             r += 1
 
         # Articulation limit: gamma is q_k's 4th component.
@@ -641,7 +649,8 @@ class AFSMPC:
                                     rows, cols, data, lo, up, r)
             r = self._obstacle_constraint_rows(qbar, clusters, q0, rows, cols,
                                                 data, lo, up, r)
-            r = self._box_rows(rows, cols, data, lo, up, r)
+            print(f"u_ser: {u_user}")
+            r = self._box_rows(u_user, rows, cols, data, lo, up, r)
 
             x, ok = self._assemble_and_solve(P, qv, rows, cols, data, lo, up,
                                             x_ws)
