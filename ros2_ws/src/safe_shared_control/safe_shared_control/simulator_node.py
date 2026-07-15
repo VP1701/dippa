@@ -241,7 +241,7 @@ class AFSSimNode(Node):
         self.omega_max = p("omega_max", 1.2).value
         self.sim_rate = p("sim_rate", 100.0).value
         self.map_yaml = p("map_yaml", _default_map_path()).value
-        start = p("start_pose", [1.3, 1.3, 0.0, 0.0]).value
+        start = p("start_pose", [6.0, 2.0, 1.5708, 0.0]).value
 
         self.gt = GroundTruthMap(self.map_yaml)
         self.kin = AFSKinematics(self.L_f, self.L_r, self.half_w, self.r_disc, self.g_max)

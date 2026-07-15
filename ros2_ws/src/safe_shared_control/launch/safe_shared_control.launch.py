@@ -98,7 +98,7 @@ def launch_setup(context, *args, **kwargs):
 
     # start_pose is the FRONT axle [x, y, theta, gamma]; the body extends ~1.0 m
     # behind it, so keep x clear of the 0.3 m wall (rear axle = x - 1.0 at heading 0).
-    sim_params = {'start_pose': [2.0, 1.5, 0.0, 0.0]}
+    sim_params = {'start_pose': [1.5, 4.0, 0.0, 0.0]} # 1.5708
     if map_yaml:
         sim_params['map_yaml'] = map_yaml   # empty -> sim falls back to its bundled default map
     nodes = [Node(package=PKG, executable=EXE_SIM, name='simulator_node', output='screen',
