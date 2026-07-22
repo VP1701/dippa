@@ -37,661 +37,10 @@ import math
 import numpy as np
 from scipy import ndimage, sparse
 import osqp 
+import time
 
-class AFSModel:
-    def __init__(self, L_f, L_r, r_disc, discs, dt):
-        self.L_f = L_f
-        self.L_r = L_r
-        self.r_disc = r_disc
-        self.dt =  dt
-        # (kind, offset) for each disc: 3 along front body, 2 along rear body
-        self.discs = discs
-        self.A_k = np.eye(4)
-        self.B_k = np.zeros((4,2))
-        self.B_k[3,1] = dt
-
-    def f(self, q, u):
-        """Nonlinear one-step (no wrap/clip; limits handled by QP constraints)."""
-        xf, yf, th, g = q
-        vf, om = u
-        Dq = self.L_f * math.cos(g) + self.L_r
-        thd = (self.L_r * om + vf * math.sin(g)) / Dq
-
-        xf += self.dt * vf * math.cos(th)
-        yf += self.dt * vf * math.sin(th)
-        th += self.dt * thd
-        g += self.dt * om
-        return np.array([xf, yf, th, g])
-
-    def linearize(self, q, u, eps=1e-6):
-        v_f = u[0]
-        omega = u[1]
-
-        theta_f = q[2]
-        gamma = q[3]
-
-        term1 = self.L_f * np.cos(gamma) + self.L_r
-        sin_theta_f = np.sin(theta_f)
-        cos_theta_f = np.cos(theta_f)
-        sin_gamma = np.sin(gamma)
-        # calculating A_k
-        self.A_k[0,2] = -self.dt * v_f * sin_theta_f
-        self.A_k[1,2] = self.dt * v_f * cos_theta_f
-        num = v_f * self.L_f + self.L_f * self.L_r * omega * sin_gamma + self.L_r * v_f * np.cos(gamma)
-        den = (term1) ** 2
-        self.A_k[2,3] = self.dt * num / den
-
-        # calculating B_k
-        self.B_k[0,0] = self.dt * cos_theta_f
-        self.B_k[1,0] = self.dt * sin_theta_f
-        self.B_k[2,0] = self.dt * sin_gamma / (term1)
-        self.B_k[2,1] = self.dt * self.L_r / (term1)
-
-        # calculate c_k
-        F = self.f(q,u)
-
-        c_k = F - self.A_k @ q - self.B_k @ u
-
-        return self.A_k, self.B_k, c_k 
-
-    def disc_cords(self, q):
-        """ Calculates coorinates for the collision discs relative
-        to the center link.
-
-        Args:
-            - q: State vector of machine (Numpy array)
-
-        Returns:
-            - disc_coordinates: list of collision disc coordinates
-        """
-        xf, yf, th, g = q
-        thr = th - g # backbody heading
-        front_axle = np.array([xf, yf])
-
-
-        # x direction vectors
-        ef = np.array([np.cos(th), np.sin(th)])
-        er = np.array([np.cos(thr), np.sin(thr)])
-
-        # y direction vectors
-        ef_perpendicular = np.array([-np.sin(th), np.cos(th)])
-        er_perpendicular = np.array([-np.sin(thr), np.cos(thr)])
-
-
-        # Front axel is measured. Claculate center link position
-        center_link = front_axle - self.L_f * ef
-
-        disc_coordinates = []
-
-        # Disc are positioned relative to the center link frame
-        for disc_x, disc_y in self.discs:
-            if disc_x >= 0.0:
-                disc_cord = center_link + disc_x * ef + disc_y * ef_perpendicular
-            else:
-                disc_cord = center_link + disc_x * er + disc_y * er_perpendicular
-
-            disc_coordinates.append(disc_cord)
-
-        return disc_coordinates
-
-
-    def disc_jacobians(self, q):
-        """J_i = d p_i / d q  (2x4) per disc, evaluated at q.
-        
-        Args:
-            - q: State vector of machine (Numpy array)
-            
-        Return:
-            - Jacobians: list of collision disc jacobians
-        """
-        xf, yf, th, g = q
-        thr = th - g
-        
-        # x direction vectors
-        ef = np.array([np.cos(th), np.sin(th)])
-        er = np.array([np.cos(thr), np.sin(thr)])
-
-        # y direction vectors
-        ef_perpendicular = np.array([-np.sin(th), np.cos(th)])
-        er_perpendicular = np.array([-np.sin(thr), np.cos(thr)])
-
-        Jacobians = []
-        for disc_x, disc_y in self.discs:
-            if disc_x >= 0.0:
-                J = np.column_stack([
-                    [1.0, 0.0],
-                    [0.0, 1.0],
-                    -self.L_f * ef_perpendicular + disc_x * ef_perpendicular + disc_y * -ef,
-                    [0.0, 0.0]
-                ])
-            else:
-                # Chain rule for derivatin sin(th - g) and cos(th - g)
-                J = np.column_stack([
-                    [1.0, 0.0],
-                    [0.0, 1.0],
-                    -self.L_f * er_perpendicular + disc_x * er_perpendicular - disc_y * er,
-                    -disc_x * er_perpendicular + disc_y * er
-                ])
-            Jacobians.append(J)
-        return Jacobians
-
-
-# =========================================================================== #
-# CBF-MPC solver (ROS-independent)                                            #
-# =========================================================================== #
-class AFSMPC:
-    def __init__(self, model, H=8, gamma_cbf=2.5, margin=0.1,
-                 influence_R=1.5, q_v=1.0, q_w=0.3, r_v=0.1, r_w=0.25,
-                 w_term=1.0, w_slack=1e4, w_slack_lin=1e3,
-                 v_max=1.2, omega_max=1.2, g_max=0.75,
-                 sqp_iters=3, intent_reset_thresh=1.0, eps_tol=0.03):
-        self.model = model
-        self.H = H
-        self.dt =  model.dt
-          
-        self.alpha = float(np.clip(gamma_cbf * self.dt, 1e-3, 1.0))
-        self.margin = margin
-        self.influence_R = influence_R
-        self.Qu = np.array([q_v, q_w]); self.R = np.array([r_v, r_w])
-        self.w_term, self.w_slack = w_term, w_slack
-        self.w_slack_lin = w_slack_lin
-        self.v_max = v_max
-        self.omega_max = omega_max
-        self.g_max = g_max
-        self.eps_tol = float(eps_tol)     # first-step slack above this => "no safe action"
-        self.nz = 9 * H
-        self.sqp_iters = int(sqp_iters)
-        self.intent_reset_thresh = float(intent_reset_thresh)
-        self.x_prev = None
-        self._useq_prev = None
-        self._u_user_prev = None
-
-    # --- index helpers into Z ---
-    def iq(self, k):  return 6 * (k - 1)            # q~_k start (k=1..H)
-    def idu(self, k): return 6 * self.H + 2 * k     # du_k start (k=0..H-1)
-    def ieps(self, k): return 8 * self.H + (k - 1)  # eps_k      (k=1..H)
-
-    def _linearize_over_horizon(self, qbar, u_seq):
-        """ Linearizes the LTV system per timestep
-        
-        """
-
-        A_incremental_list = []
-        B_incremental_list = []
-        c_incremental_list = []
-
-        for k in range(self.H):
-            # Get linearized matrices
-            A, B, c = self.model.linearize(qbar[k], u_seq[k])
-
-            # Construct augmented form for incremental control
-            A_aug = np.block([[A, B], [np.zeros((2,4)), np.eye(2)]])
-            B_aug = np.vstack([B, np.eye(2)])
-            c_aug = np.concatenate([c, np.zeros(2)])
-            A_incremental_list.append(A_aug)
-            B_incremental_list.append(B_aug)
-            c_incremental_list.append(c_aug)
-
-        return A_incremental_list, B_incremental_list, c_incremental_list
-
-    def _nominal_trajectory(self, q0, u_seq):
-        """ Calculates the nominal trajectory for the vehicle
-        based on the current state and given control sequence
-        
-        Args:
-            - q0: current state
-            - u_seq: control sequence
-            
-        Return:
-            - qbar: list of predicted future states
-        """
-
-        qbar = [q0]
-        for k in range(self.H):
-            q_pred = self.model.f(qbar[k], u_seq[k])
-            qbar.append(q_pred)
-
-
-        return qbar
-
-    def _disc_cluster_distance(self, disc_position, cluster):
-        """ Calculates the dinstace from disc position to the nearest
-        obastacle point in cluster of obstacle points"""
-
-        # Calculate euclidian distance to each cluster point
-        dist = np.sqrt(((cluster - disc_position[None, :])**2).sum(axis=1))
-
-        index = dist.argmin()
-        smallest_dist = dist[index]
-
-        if smallest_dist > self.influence_R:
-            return None
-        
-        nearest_point = cluster[index]
-        h = smallest_dist - self.model.r_disc - self.margin
-        return nearest_point, smallest_dist, h
-
-    def _disc_cluster_horizon(self, disc_positions, cluster):
-        """ Calculates the nearest point, smallest distance and h for 
-        one obstacle disc and one obstacle cluster per timestep in horizon. 
-        If oobstacle not in range for that timestep result is None"""
-
-        results = []
-
-        for k in range(len(disc_positions)):
-            results.append(self._disc_cluster_distance(disc_positions[k], cluster))
-
-        return results
-
-    def _linearize_obstacle_clearance(self, disc_position, qbar_k, nearest_point, dist, h, disc_jacobian_k):
-        """ Linearizes the obstacle collision circle to a tangent line which creates
-        a half plane shaped safe region
-        
-        Args:
-        
-        
-        Returns;
-        
-        """
-
-        # calculate normal vector between obstacle point and vehicle point
-        normal = (disc_position - nearest_point) / dist
-        a = normal @ disc_jacobian_k
-        b = h - a @ qbar_k
-        return a, b
-
-    def _linearize_disc_cluster_horizon(self, disc_positions, qbar, disc_jacobians, results):
-        """
-        
-        
-        """
-        
-        linearized = []
-
-        for k, result in enumerate(results):
-            if result is None:
-                linearized.append(None)
-                continue
-
-            nearest_point, dist, h = result
-
-            a, b = self._linearize_obstacle_clearance(disc_positions[k], qbar[k], nearest_point, dist, h,
-                disc_jacobians[k])
-
-            linearized.append((a, b))
-
-        return linearized
-
-    def _obstacle_rows(self, linearized, q0, rows, cols, data, lo, up, r):
-        
-        for k in range(self.H):
-            if linearized[k] is None or linearized[k + 1] is None:
-                continue
-            
-            a_k, b_k = linearized[k]
-            a_k_next, b_k_next = linearized[k + 1]
-
-            iq_k_next = self.iq(k + 1)
-
-            for b in range(4):
-                rows.append(r)
-                cols.append(iq_k_next + b)
-                data.append(a_k_next[b])
-
-            rows.append(r)
-            cols.append(self.ieps(k + 1))
-            data.append(1.0)
-
-            if k == 0:
-                lo.append((1 - self.alpha)*(a_k @ q0 + b_k) - b_k_next)
-            else:
-                iq_k = self.iq(k)
-                for b in range(4):
-                    rows.append(r) #
-                    cols.append(iq_k + b)
-                    data.append(-(1 - self.alpha) * a_k[b])
-                lo.append((1 - self.alpha)*b_k - b_k_next)
-            
-            up.append(np.inf)
-            r += 1
-
-        return r
-
-    def _obstacle_constraint_rows(self, qbar, clusters, q0, rows, cols,
-                                  data, lo, up, r):
-        """ Appends obstacle constraint rows for every collsiion disc
-        agains every obstacle cluster
-        
-        
-        
-        """     
-
-        num_steps = self.H + 1
-        num_discs = len(self.model.discs)
-
-        # Get position and jacobian for each disc over the whole horizon
-        position_at_step = []
-        jacobian_at_step = [] 
-        for k in range(num_steps):
-            position_at_step.append(self.model.disc_cords(qbar[k]))
-            jacobian_at_step.append(self.model.disc_jacobians(qbar[k])) 
-
-
-        # Get position and jacobian for a disc over the whole horizon
-        for disc_index in range(num_discs):
-            disc_positions = []
-            disc_jacobians = []
-
-            for k in range(num_steps):
-                disc_positions.append(position_at_step[k][disc_index])
-                disc_jacobians.append(jacobian_at_step[k][disc_index])
-            disc_positions = np.array(disc_positions)
-
-            # build obstacle row for disc against cluster
-            for cluster in clusters:
-                horizon = self._disc_cluster_horizon(disc_positions, cluster)
-
-                linearized_obstacle = self._linearize_disc_cluster_horizon(
-                disc_positions, qbar, disc_jacobians, horizon)
-
-                r = self._obstacle_rows(linearized_obstacle, q0, rows, cols, data,
-                                        lo, up, r)
-
-        return r
-
-
-    def _dynamics_rows(self, q0, u_prev, A_list, B_list, c_list, rows, cols,
-                    data, lo, up, r):
-        q_aug_0 = np.concatenate([q0, u_prev])
-
-        for k in range(self.H):
-            A_k = A_list[k]
-            B_k = B_list[k]
-            c_k = c_list[k]
-
-            iq_k_next = self.iq(k + 1)
-            idu_k = self.idu(k)
-
-            # q~_{k+1} block: identity coefficients, one row per component.
-            for row in range(6):
-                rows.append(r + row)
-                cols.append(iq_k_next + row)
-                data.append(1.0)
-
-            # -B_k @ du_k block: each of the 6 rows gets 2 column entries.
-            for row in range(6):
-                for col in range(2):
-                    rows.append(r + row)
-                    cols.append(idu_k + col)
-                    data.append(-B_k[row, col])
-
-            if k == 0:
-                # q~_0 is known, not a variable: fold A_k @ q~_0 into rhs.
-                rhs = A_k @ q_aug_0 + c_k
-            else:
-                # q~_k block: -A_k coefficients, 6x6 entries.
-                iq_k = self.iq(k)
-                for row in range(6):
-                    for col in range(6):
-                        rows.append(r + row)
-                        cols.append(iq_k + col)
-                        data.append(-A_k[row, col])
-                rhs = c_k
-
-            # Equality: lo == up == rhs, one value per row.
-            for row in range(6):
-                lo.append(rhs[row])
-                up.append(rhs[row])
-
-            r += 6
-
-        return r
-
-
-    def _box_rows(self, u_user, rows, cols, data, lo, up, r):
-        """Appends actuator/state-limit and slack-nonnegativity rows.
-
-        - |v| <= v_max, |omega| <= omega_max, for u_k (k = 0..H-1)
-        - |gamma| <= g_max, for q_k's gamma component (k = 1..H)
-        - eps_k >= 0 (k = 1..H)
-
-        Args:
-            rows, cols, data, lo, up: shared sparse-triplet lists to
-                append to (mutated in place).
-            r: int, next free row index.
-
-        Returns:
-            r: updated next free row index.
-        """
-        omega_deadzone = 1e-3  
-        if u_user[1] > omega_deadzone:
-            omega_lo, omega_hi = 0.0, self.omega_max
-        elif u_user[1] < -omega_deadzone:
-            omega_lo, omega_hi = -self.omega_max, 0.0
-        else:
-            omega_lo, omega_hi = 0.0, 0.0
-
-        # Input limits: u_k lives in q~_{k+1}'s trailing 2 components.
-        for k in range(self.H):
-            iu = self.iq(k + 1) + 4
-            rows.append(r); cols.append(iu); data.append(1.0)
-            lo.append(-self.v_max); up.append(self.v_max)
-            r += 1
-
-            rows.append(r); cols.append(iu + 1); data.append(1.0)
-            lo.append(omega_lo); up.append(omega_hi)
-            r += 1
-
-        # Articulation limit: gamma is q_k's 4th component.
-        for k in range(1, self.H + 1):
-            i_gamma = self.iq(k) + 3
-            rows.append(r); cols.append(i_gamma); data.append(1.0)
-            lo.append(-self.g_max); up.append(self.g_max)
-            r += 1
-
-        # Slack non-negativity.
-        for k in range(1, self.H + 1):
-            rows.append(r); cols.append(self.ieps(k)); data.append(1.0)
-            lo.append(0.0); up.append(np.inf)
-            r += 1
-
-        return r
-
-
-    def min_clearance(self, q, clusters):
-        """Smallest disc clearance across all discs and obstacle clusters,
-        at a single pose q (h < 0 means a disc is already in the keep-out).
-
-        Args:
-            q: array (4,), a single state (not a horizon).
-            clusters: list of obstacle point clusters, each an (N, 2) array.
-
-        Returns:
-            hmin: float, the smallest clearance found (np.inf if no cluster
-            is within influence range of any disc).
-        """
-        disc_positions = self.model.disc_cords(q)
-        hmin = np.inf
-        for disc_position in disc_positions:
-            for cluster in clusters:
-                result = self._disc_cluster_distance(disc_position, cluster)
-                if result is None:
-                    continue
-                _, _, h = result
-                hmin = min(hmin, h)
-        return float(hmin)
-
-
-    def _build_cost(self, u_user):
-        """Builds the diagonal quadratic cost P and linear cost qv for the QP.
-
-        Args:
-            u_user: array (2,), the driver's held command [v, omega].
-
-        Returns:
-            P: sparse (nz, nz) diagonal cost matrix.
-            qv: array (nz,), linear cost vector.
-        """
-        Pd = np.full(self.nz, 1e-6)   # tiny regularization on every variable
-        qv = np.zeros(self.nz)
-
-        # Tracking cost: penalize u_k (in q~_{k+1}) deviating from u_user.
-        for k in range(self.H):
-            iu = self.iq(k + 1) + 4
-            Pd[iu] += 2 * self.Qu[0]
-            qv[iu] += -2 * self.Qu[0] * u_user[0]
-            Pd[iu + 1] += 2 * self.Qu[1]
-            qv[iu + 1] += -2 * self.Qu[1] * u_user[1]
-
-        # Smoothness cost: penalize du_k.
-        for k in range(self.H):
-            idu = self.idu(k)
-            Pd[idu] += 2 * self.R[0]
-            Pd[idu + 1] += 2 * self.R[1]
-
-        # Terminal cost: soft penalty on terminal speed v_f.
-        Pd[self.iq(self.H) + 4] += 2 * self.w_term
-
-        # Slack cost: quadratic + linear exact-penalty term.
-        for k in range(1, self.H + 1):
-            Pd[self.ieps(k)] += 2 * self.w_slack
-            qv[self.ieps(k)] += self.w_slack_lin
-
-        P = sparse.diags(Pd).tocsc()
-        return P, qv
-
-
-    def _assemble_and_solve(self, P, qv, rows, cols, data, lo, up, x_ws):
-        """Builds the sparse constraint matrix, solves the QP, and returns
-        the solution.
-
-        Args:
-            P: sparse (nz, nz) diagonal cost matrix, from _build_cost.
-            qv: array (nz,), linear cost vector, from _build_cost.
-            rows, cols, data: sparse-triplet entries for the constraint
-                matrix Ac, accumulated by the row-builder methods.
-            lo, up: lists of lower/upper bounds, one per constraint row.
-            x_ws: array (nz,) or None, warm-start guess for the primal
-                solution.
-
-        Returns:
-            x: array (nz,), the solution, or None if the solve failed.
-            ok: bool, whether the solve succeeded.
-        """
-        num_rows = len(lo)
-        Ac = sparse.csc_matrix((data, (rows, cols)), shape=(num_rows, self.nz))
-
-        prob = osqp.OSQP()
-        prob.setup(P=P, q=qv, A=Ac, l=np.array(lo), u=np.array(up),
-                verbose=False, warm_starting=True, max_iter=8000,
-                eps_abs=1e-4, eps_rel=1e-4, polish=True)
-
-        if x_ws is not None and len(x_ws) == self.nz:
-            try:
-                prob.warm_start(x=x_ws)
-            except Exception:
-                pass
-
-        res = prob.solve()
-        ok = (res.info.status_val in (1, 2)
-            and res.x is not None
-            and np.all(np.isfinite(res.x)))
-        return (res.x if ok else None), ok
-
-    def solve(self, q0, u_prev, u_user, clusters):
-        """Solves the CBF-MPC QP for one control tick.
-
-        Args:
-            q0: array (4,), current state.
-            u_prev: array (2,), previously applied input.
-            u_user: array (2,), driver's held command [v, omega].
-            clusters: list of obstacle point clusters, each an (N, 2) array.
-
-        Returns:
-            u0: array (2,), the command to apply now.
-            planned: list of H+1 states, the MPC's planned trajectory
-                (None if the solve failed).
-            qbar: list of H+1 states, the last nonlinear nominal used.
-            ok: bool, whether a feasible solve was found.
-            info: dict with diagnostic fields (min_h_now, slack_now,
-                slack_max, infeasible, solver_failed).
-        """
-        q0 = np.asarray(q0, float)
-        u_prev = np.asarray(u_prev, float)
-        u_user = np.asarray(u_user, float)
-
-        # Warm-start the nominal input sequence, unless the driver's intent
-        # just flipped (forward<->reverse or a large command jump), in which
-        # case we reseed from the held command so the new intent takes
-        # effect immediately instead of crawling out of the stale plan.
-        prev = self._u_user_prev
-        flip = (prev is None
-                or u_user[0] * prev[0] < -0.05
-                or np.linalg.norm(u_user - prev) > self.intent_reset_thresh)
-        if self._useq_prev is not None and not flip:
-            u_seq = np.vstack([self._useq_prev[1:], self._useq_prev[-1:]])
-        else:
-            u_seq = np.tile(u_user, (self.H, 1))
-        self._u_user_prev = np.array(u_user, float)
-
-        x_ws = self.x_prev
-        P, qv = self._build_cost(u_user)
-        best = None
-        qbar = None
-
-        for _ in range(self.sqp_iters):
-            qbar = self._nominal_trajectory(q0, u_seq)
-            A_list, B_list, c_list = self._linearize_over_horizon(qbar, u_seq)
-
-            rows, cols, data, lo, up = [], [], [], [], []
-            r = 0
-            r = self._dynamics_rows(q0, u_prev, A_list, B_list, c_list,
-                                    rows, cols, data, lo, up, r)
-            r = self._obstacle_constraint_rows(qbar, clusters, q0, rows, cols,
-                                                data, lo, up, r)
-            print(f"u_ser: {u_user}")
-            r = self._box_rows(u_user, rows, cols, data, lo, up, r)
-
-            x, ok = self._assemble_and_solve(P, qv, rows, cols, data, lo, up,
-                                            x_ws)
-            if not ok:
-                break
-
-            x_ws = x
-            u_seq = np.array([x[self.iq(k + 1) + 4:self.iq(k + 1) + 6]
-                            for k in range(self.H)])
-            planned = [q0] + [x[self.iq(k):self.iq(k) + 4]
-                            for k in range(1, self.H + 1)]
-            best = (u_prev + x[self.idu(0):self.idu(0) + 2], planned,
-                    list(qbar), x, u_seq)
-
-        if best is None:
-            # SAFE FALLBACK: a failed/maxed-out solve must NOT hold the last
-            # (possibly forward) command -- that would drive through a wall.
-            # Stop instead; the next tick re-solves from rest.
-            self._useq_prev = None
-            info = {'min_h_now': self.min_clearance(q0, clusters),
-                    'slack_now': float('inf'), 'slack_max': float('inf'),
-                    'infeasible': True, 'solver_failed': True}
-            return np.zeros(2), None, [q0], False, info
-
-        u0, planned, qbar, x, u_seq = best
-        self.x_prev = x
-        self._useq_prev = u_seq
-        slack_now = float(x[self.ieps(1)]) if self.H >= 1 else 0.0
-        slack_max = float(max(x[self.ieps(k)] for k in range(1, self.H + 1)))
-        info = {'min_h_now': self.min_clearance(q0, clusters),
-                'slack_now': slack_now, 'slack_max': slack_max,
-                'infeasible': slack_now > self.eps_tol, 'solver_failed': False}
-        return u0, planned, qbar, True, info
-
-
-
-
-
-
-
-    
+from safe_shared_control.afs_mpc import AFSMPC
+from safe_shared_control.afs_model import AFSModel
 
 def clip_halfplane(poly, n, d):
     """Clip convex polygon (list of (x,y)) to the half-plane n.x >= d."""
@@ -727,7 +76,7 @@ def build_clusters(prob_grid, res, origin, nx, ny, region_min, region_max,
     local = occupied[j0:j1, i0:i1]
     if not local.any():
         return []
-    labels, n = ndimage.label(local)
+    labels, n = ndimage.label(local, structure=np.ones((3, 3)))
     clusters = []
     for lab in range(1, n + 1):
         ys, xs = np.where(labels == lab)
@@ -744,7 +93,7 @@ def _ros():
     from rclpy.node import Node
     from rclpy.qos import (QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy,
                            QoSHistoryPolicy)
-    from std_msgs.msg import Float64, Float64MultiArray, ColorRGBA
+    from std_msgs.msg import Float64, Float64MultiArray, ColorRGBA, Empty
     from sensor_msgs.msg import Joy
     from nav_msgs.msg import Odometry, OccupancyGrid, Path
     from geometry_msgs.msg import PoseStamped, Quaternion, Point
@@ -752,7 +101,7 @@ def _ros():
     return (rclpy, Node, QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy,
             QoSHistoryPolicy, Float64, Float64MultiArray,
             Joy, Odometry, OccupancyGrid, Path, PoseStamped, Quaternion,
-            Marker, MarkerArray, Point, ColorRGBA)
+            Marker, MarkerArray, Point, ColorRGBA, Empty)
 
 
 class StaticOGM:
@@ -794,7 +143,7 @@ def main(args=None):
     (rclpy, Node, QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy,
      QoSHistoryPolicy, Float64, Float64MultiArray, Joy,
      Odometry, OccupancyGrid, Path, PoseStamped, Quaternion,
-     Marker, MarkerArray, Point, ColorRGBA) = _ros()
+     Marker, MarkerArray, Point, ColorRGBA, Empty) = _ros()
 
     class AFSMPCNode(Node):
         def __init__(self):
@@ -802,11 +151,11 @@ def main(args=None):
             p = self.declare_parameter
             self.L_f = p("link_front", 0.5).value
             self.L_r = p("link_rear", 0.5).value
-            self.r_disc = p("disc_radius", 0.4).value
+            self.r_disc = p("disc_radius", 0.2).value
             self.g_max = p("gamma_max", 0.75).value
             self.v_max = p("v_max", 1.2).value
             self.omega_max = p("omega_max", 1.2).value
-            self.H = p("horizon", 16).value
+            self.H = p("horizon", 8).value
             self.dt = p("mpc_dt", 0.2).value
             self.gamma_cbf = p("cbf_gamma", 0.5).value
             self.margin = p("margin", 0.1).value
@@ -820,7 +169,7 @@ def main(args=None):
             self.w_term = p("terminal_speed_weight", 1.0).value
             self.w_slack = p("slack_weight", 1e4).value
             self.w_slack_lin = p("slack_weight_lin", 1e3).value
-            self.sqp_iters = p("sqp_iters", 3).value
+            self.sqp_iters = p("sqp_iters", 2).value
             self.intent_reset_thresh = p("intent_reset_thresh", 1.0).value
             self.stop_on_infeasible = p("stop_on_infeasible", True).value
             self.eps_tol = p("infeasible_slack_tol", 0.03).value
@@ -836,9 +185,13 @@ def main(args=None):
             self.joy_timeout = p("joy_timeout", 0.5).value
             self.assist_button = p("assist_button", 0).value   # -1 to disable the toggle
             self.assist_default = p("assist_default", True).value  # start with the MPC filter on/off
+            self.reset_button = p("reset_button", 1).value 
+
+            self.max_time = 1 / self.ctrl_rate
 
             # Set collision disc coordinates
-            discs = [(self.L_f, 0), (-self.L_r, 0)]
+            discs = [(1.5 * self.L_f, 0), (0.5 * self.L_f, 0.0),
+                     (-0.5 * self.L_r, 0.0), (-1.0 * self.L_r, 0.0)]
             self.model = AFSModel(self.L_f, self.L_r, self.r_disc, discs, self.dt)
             self.mpc = AFSMPC(self.model, H=self.H, gamma_cbf=self.gamma_cbf,
                               margin=self.margin, influence_R=self.influence_R,
@@ -857,14 +210,18 @@ def main(args=None):
             self.u_prev = np.zeros(2); self._last_joy = None
             self.assist = bool(self.assist_default)
             self._prev_btn = 0
+            self._prev_btn = 0
+            self._prev_reset_btn = 0
 
             self.pub = self.create_publisher(Float64MultiArray, "afs/cmd", 10)
+            self.pub_reset = self.create_publisher(Empty, "afs/reset", 10)
             self.pub_map = self.create_publisher(OccupancyGrid, "afs/ogm", 1)
             self.pub_safe = self.create_publisher(OccupancyGrid, "afs/safe_region", 1)
             self.pub_intent = self.create_publisher(Path, "afs/intent_path", 1)
             self.pub_plan = self.create_publisher(Path, "afs/planned_path", 1)
             self.pub_poly = self.create_publisher(MarkerArray, "afs/polytopes", 1)
             self.pub_status = self.create_publisher(MarkerArray, "afs/status", 1)
+            self.pub_discs = self.create_publisher(MarkerArray, "afs/discs", 10)
             self.create_subscription(Joy, self.joy_topic, self.joy_cb, 10)
             map_qos = QoSProfile(depth=1, history=QoSHistoryPolicy.KEEP_LAST,
                                  reliability=QoSReliabilityPolicy.RELIABLE,
@@ -880,6 +237,32 @@ def main(args=None):
                 f"Waiting for static map on {self.map_topic}. "
                 f"assist={'ON' if self.assist else 'OFF (manual)'}")
 
+        def _publish_discs(self, state):
+            """Draws each collision disc as a flat circle at its current
+            position, sized to its actual radius -- lets you see the safety
+            envelope the MPC is actually enforcing while you drive."""
+            arr = MarkerArray()
+            clear = Marker(); clear.action = Marker.DELETEALL
+            arr.markers.append(clear)
+            positions = self.model.disc_cords(state)
+            for i, p in enumerate(positions):
+                m = Marker()
+                m.header.frame_id = "odom"
+                m.header.stamp = self.get_clock().now().to_msg()
+                m.ns = "collision_discs"
+                m.id = i
+                m.type = Marker.CYLINDER
+                m.action = Marker.ADD
+                m.pose.position.x = float(p[0])
+                m.pose.position.y = float(p[1])
+                m.pose.position.z = 0.05
+                m.pose.orientation.w = 1.0
+                m.scale.x = m.scale.y = 2.0 * self.r_disc
+                m.scale.z = 0.05
+                m.color = ColorRGBA(r=0.2, g=0.6, b=1.0, a=0.35)
+                arr.markers.append(m)
+            self.pub_discs.publish(arr)
+            
         def _dz(self, x):
             if abs(x) < self.deadzone: return 0.0
             return (x - math.copysign(self.deadzone, x)) / (1.0 - self.deadzone)
@@ -897,10 +280,20 @@ def main(args=None):
                 self.omega_cmd = (1 - a) * self.omega_cmd + a * wt
             if 0 <= self.assist_button < len(msg.buttons):
                 b = msg.buttons[self.assist_button]
-                if b and not self._prev_btn:                  # rising edge -> toggle
+                if b and not self._prev_btn:
                     self.assist = not self.assist
                     self.get_logger().info(f"MPC assist {'ON' if self.assist else 'OFF (raw passthrough)'}")
                 self._prev_btn = b
+            if 0 <= self.reset_button < len(msg.buttons):
+                rb = msg.buttons[self.reset_button]
+                if rb and not self._prev_reset_btn:
+                    self.pub_reset.publish(Empty())
+                    self.mpc.x_prev = None
+                    self.mpc._useq_prev = None
+                    self.mpc._u_user_prev = None
+                    self.u_prev = np.zeros(2)
+                    self.get_logger().info("Reset requested -> published /afs/reset, cleared MPC warm-start")
+                self._prev_reset_btn = rb
 
         def odom_cb(self, msg):
             self.pose = (msg.pose.pose.position.x, msg.pose.pose.position.y,
@@ -934,7 +327,7 @@ def main(args=None):
             for _ in range(self.H):
                 intent.append(self.model.f(intent[-1], u_user))
             self._publish_path(self.pub_intent, intent)
-
+            self._publish_discs(self.state)
             if not self.assist:
                 # Manual / raw passthrough: no CBF-MPC filtering at all, so you
                 # can A/B whether the safety filter is actually doing anything.
@@ -957,19 +350,31 @@ def main(args=None):
             clusters = build_clusters(self.ogm.prob(), self.ogm.res, self.ogm.origin,
                                       self.ogm.nx, self.ogm.ny,
                                       (cx - reach, cy - reach), (cx + reach, cy + reach))
+            t0 = time.perf_counter()                          
             u0, planned, qbar, ok, info = self.mpc.solve(self.state, self.u_prev, u_user, clusters)
+            t1 = time.perf_counter()
+            solve_time = t1 - t0
+            self.get_logger().info(f"MPC solve took {solve_time*1000:.1f} ms")
+            if solve_time > self.max_time:
+                self.get_logger().warn(
+                    f"MPC solve took {solve_time*1000:.1f} ms, exceeding the "
+                    f"{self.max_time*1000:.1f} ms control period (rate={self.ctrl_rate} Hz)")
+
             infeasible = bool(info['infeasible'])         # no safe action for the next step
             unsafe_now = info['min_h_now'] < 0.0          # a disc is already inside the keep-out
             driver_cmd = bool(abs(u_user[0]) > 1e-3 or abs(u_user[1]) > 1e-3)
             if infeasible and self.stop_on_infeasible:
                 u0 = np.zeros(2)                          # STOP: refuse to enter the unsafe region
+                self.mpc.x_prev = None
+                self.mpc._useq_prev = None
+                
             self.u_prev = u0
             self.pub.publish(Float64MultiArray(data=[float(u0[0]), float(u0[1])]))
             if planned is not None:
                 self._publish_path(self.pub_plan, planned)
             self._publish_status(infeasible, unsafe_now, driver_cmd, info)
             if self.viz_polytopes and planned is not None:
-                self._publish_polytopes(planned, clusters)
+                self._publish_polytopes(planned, self.mpc._last_relevant_clusters)
 
         def _publish_path(self, pub, traj):
             path = Path(); path.header.frame_id = "odom"

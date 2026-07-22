@@ -52,7 +52,7 @@ import yaml
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
-from std_msgs.msg import Float64, Bool, Float64MultiArray
+from std_msgs.msg import Float64, Bool, Float64MultiArray, Empty
 from geometry_msgs.msg import Twist, TransformStamped, Quaternion
 from nav_msgs.msg import Odometry, OccupancyGrid
 from visualization_msgs.msg import Marker, MarkerArray
@@ -202,11 +202,13 @@ class AFSKinematics:
 
     def integrate(self, state, v_f, omega, dt):
         xf, yf, th_f, g = state
-        thd = self.theta_f_dot(v_f, omega, g)
+        at_limit = (g >= self.g_max and omega > 0) or (g <= -self.g_max and omega < 0)
+        eff_omega = 0.0 if at_limit else omega
+        thd = self.theta_f_dot(v_f, eff_omega, g)
         xf += dt * v_f * math.cos(th_f)
         yf += dt * v_f * math.sin(th_f)
         th_f = math.atan2(math.sin(th_f + dt * thd), math.cos(th_f + dt * thd))
-        g = float(np.clip(g + dt * omega, -self.g_max, self.g_max))
+        g = float(np.clip(g + dt * eff_omega, -self.g_max, self.g_max))
         return np.array([xf, yf, th_f, g])
 
     def frames(self, state):
@@ -243,6 +245,10 @@ class AFSSimNode(Node):
         self.map_yaml = p("map_yaml", _default_map_path()).value
         start = p("start_pose", [6.0, 2.0, 1.5708, 0.0]).value
 
+        # Save start pose
+        self.state = np.array(start, dtype=float)
+        self.start_pose = self.state.copy()
+
         self.gt = GroundTruthMap(self.map_yaml)
         self.kin = AFSKinematics(self.L_f, self.L_r, self.half_w, self.r_disc, self.g_max)
         self.state = np.array(start, dtype=float)
@@ -260,6 +266,7 @@ class AFSSimNode(Node):
         self.tf = TransformBroadcaster(self)
         self.create_subscription(Float64MultiArray, "afs/cmd", self.cmd_cb, 10)
         self.create_subscription(Twist, "cmd_vel", self.twist_cb, 10)
+        self.create_subscription(Empty, "afs/reset", self.reset_cb, 10)
 
         self._map_msg = self._build_map_msg()
         self.pub_map.publish(self._map_msg)          # latched (transient local) copy
@@ -283,6 +290,11 @@ class AFSSimNode(Node):
         msg.info.origin.orientation.w = 1.0
         msg.data = self.gt.occupancy_grid_data().flatten().tolist()
         return msg
+
+    def reset_cb(self, msg):
+        self.state = self.start_pose.copy()
+        self.cmd = np.zeros(2)
+        self.get_logger().info(f"Reset -> state back to start pose {self.start_pose.tolist()}")
 
     def _republish_map(self):
         self._map_msg.header.stamp = self.get_clock().now().to_msg()
