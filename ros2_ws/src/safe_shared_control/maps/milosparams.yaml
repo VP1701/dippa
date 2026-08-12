@@ -1,0 +1,38 @@
+
+# Elevation Gridmap Parameters
+# Generated from rutprocess.launch nodes
+
+# Front elevation map parameters
+map_frame: "map"
+do_reset: false
+occgrid_vis_z: 18.
+do_save_elevimg: true
+do_save_occimg: true
+discretize_elevimg: true
+
+cellsize: 0.1
+height: 100.
+width: 200.
+discretize_elevimg: true
+elevimg_z_res: 0.005
+clearance_thr_pos_low: 0.
+clearance_thr_pos_high: 10.
+clearance_thr_dir_low: .01
+clearance_thr_dir_high: 1000.
+do_clear_pos: true
+do_clear_dir: false
+invert_clear_pos: true
+invert_clear_dir: true
+max_clearance_age: 1.
+
+
+# Common parameters
+traversable_slope: .78
+traversability_r: 0.5
+traversable_z: 1e6
+crop_z_max: 1e6
+cell_z_var: 1.0
+cell_sensor_var: 0.1
+cell_system_var: 0.01
+cell_update_var: false
+
