@@ -408,7 +408,6 @@ class AFSMPC:
         P = sparse.diags(Pd).tocsc()
         return P, qv
 
-
     def _assemble_and_solve(self, P, qv, rows, cols, data, lo, up, x_ws):
         """Builds the sparse constraint matrix, solves the QP, and returns
         the solution.
@@ -427,9 +426,11 @@ class AFSMPC:
             ok: bool, whether the solve succeeded.
         """
         num_rows = len(lo)
+        # Recreate constrain matrix for current iteration
         Ac = sparse.csc_matrix((data, (rows, cols)), shape=(num_rows, self.nz))
 
         prob = osqp.OSQP()
+        # Setup the QP
         prob.setup(P=P, q=qv, A=Ac, l=np.array(lo), u=np.array(up),
                 verbose=False, warm_starting=True, max_iter=8000,
                 eps_abs=1e-4, eps_rel=1e-4, polish=True)
@@ -441,7 +442,7 @@ class AFSMPC:
                 pass
 
         res = prob.solve()
-        ok = (res.info.status_val in (1, 2)
+        ok = (res.info.status_val in (1, 2) # 1 = OSQP_SOLVED, 2 = OSQP_SOLVED_INACCURATE
             and res.x is not None
             and np.all(np.isfinite(res.x)))
         return (res.x if ok else None), ok
@@ -468,10 +469,8 @@ class AFSMPC:
         u_prev = np.asarray(u_prev, float)
         u_user = np.asarray(u_user, float)
 
-        # Warm-start the nominal input sequence, unless the driver's intent
-        # just flipped (forward<->reverse or a large command jump), in which
-        # case we reseed from the held command so the new intent takes
-        # effect immediately instead of crawling out of the stale plan.
+        # Check if the user command changed significantly. if not use the previous solution
+        # as the nominal command for nominla trajectory calculation.
         prev = self._u_user_prev
         flip = (prev is None
                 or u_user[0] * prev[0] < -0.05
@@ -487,6 +486,8 @@ class AFSMPC:
         best = None
         qbar = None
 
+        # Solve a sequential quadratic programming problem. Linearize around the nominal trajectory
+        # and solve for sqp_iters times.
         for _ in range(self.sqp_iters):
             t0 = time.perf_counter()
             qbar = self._nominal_trajectory(q0, u_seq)
@@ -505,7 +506,7 @@ class AFSMPC:
             x, ok = self._assemble_and_solve(P, qv, rows, cols, data, lo, up, x_ws)
             t5 = time.perf_counter()
 
-            #print(f"rollout+lin={1e3*(t1-t0):.1f}ms dyn={1e3*(t2-t1):.1f}ms "f"obstacles={1e3*(t3-t2):.1f}ms box={1e3*(t4-t3):.1f}ms "f"osqp={1e3*(t5-t4):.1f}ms")
+            print(f"rollout+lin={1e3*(t1-t0):.1f}ms dyn={1e3*(t2-t1):.1f}ms "f"obstacles={1e3*(t3-t2):.1f}ms box={1e3*(t4-t3):.1f}ms "f"osqp={1e3*(t5-t4):.1f}ms", flush=True)
             if not ok:
                 break
 
@@ -518,9 +519,7 @@ class AFSMPC:
                     list(qbar), x, u_seq)
 
         if best is None:
-            # SAFE FALLBACK: a failed/maxed-out solve must NOT hold the last
-            # (possibly forward) command -- that would drive through a wall.
-            # Stop instead; the next tick re-solves from rest.
+            
             self._useq_prev = None
             info = {'min_h_now': self.min_clearance(q0, self._last_relevant_clusters),
                     'slack_now': float('inf'), 'slack_max': float('inf'),

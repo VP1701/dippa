@@ -98,7 +98,7 @@ def launch_setup(context, *args, **kwargs):
 
     # start_pose is the FRONT axle [x, y, theta, gamma]; the body extends ~1.0 m
     # behind it, so keep x clear of the 0.3 m wall (rear axle = x - 1.0 at heading 0).
-    sim_params = {'start_pose': [1.5, 4.0, 0.0, 0.0]} # 1.5708
+    sim_params = {'start_pose': [50, 50, 0.0, 0.0]} # 1.5708
     if map_yaml:
         sim_params['map_yaml'] = map_yaml   # empty -> sim falls back to its bundled default map
     nodes = [Node(package=PKG, executable=EXE_SIM, name='simulator_node', output='screen',
@@ -129,9 +129,8 @@ def launch_setup(context, *args, **kwargs):
             ))
         elif input_dev == 'ponsse':
             nodes.append(Node(
-                package='ponsse_controllers', executable='ponsse_controllers',
-                name='ponsse_controllers', output='screen',
-            ))
+                package='ponsse_handles', executable='handle_node',
+                name='handle_node', output='screen'))
         elif input_dev == 'keyboard':
             # Spawn in its own terminal so it has keyboard focus / stdin (a node
             # launched normally by ros2 launch has no interactive TTY). Needs xterm:
@@ -153,8 +152,8 @@ def launch_setup(context, *args, **kwargs):
         if is_mpc:
             # NOTE: these node params are what actually take effect (they override the
             # AFSMPC class defaults). Tune the controller HERE, not in the .py signature.
-            ctrl_params.update(dict(horizon=12, mpc_dt=0.2, cbf_gamma=2.5,
-                                    margin=0.1, disc_radius=0.28, influence_radius=1.5,
+            ctrl_params.update(dict(horizon=8, mpc_dt=0.2, cbf_gamma=2.5,
+                                    margin=0.1, disc_radius=1.5, influence_radius=3.5,
                                     smooth_v=0.1, control_rate=20.0))
         nodes.append(Node(
             package=PKG, executable=(EXE_MPC if is_mpc else EXE_REACTIVE),

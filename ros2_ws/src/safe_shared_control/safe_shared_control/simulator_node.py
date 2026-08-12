@@ -164,7 +164,7 @@ def _default_map_path():
 # Ground truth: static map + distance transform for collision checks          #
 # --------------------------------------------------------------------------- #
 class GroundTruthMap:
-    def __init__(self, yaml_path):
+    def __init__(self, yaml_path, unknown_is_obstacle=True):
         m = load_ros_map(yaml_path)
         self.res = m['res']
         self.origin = np.array(m['origin'], float)
@@ -172,7 +172,10 @@ class GroundTruthMap:
         self.occupied = m['occupied']
         self.free = m['free']
         from scipy import ndimage
-        self.edt = ndimage.distance_transform_edt(~self.occupied) * self.res
+        # Blocked = occupied, plus (optionally) unknown. `free` is the explicit
+        # free mask; anything not free is either occupied or unknown.
+        blocked = self.occupied if not unknown_is_obstacle else ~self.free
+        self.edt = ndimage.distance_transform_edt(~blocked) * self.res
 
     def world_to_cell(self, p):
         c = ((np.asarray(p) - self.origin) / self.res).astype(int)
@@ -193,14 +196,14 @@ class GroundTruthMap:
 
 class AFSKinematics:
     """Front-referenced articulated kinematics."""
-    def __init__(self, L_f=0.5, L_r=0.5, half_w=0.22, r_disc=0.28, g_max=0.75):
+    def __init__(self, L_f=1.1059, L_r=0.985777778, half_w=0.9, r_disc=1.5, g_max=0.75):
         self.L_f, self.L_r = L_f, L_r
         self.half_w, self.r_disc, self.g_max = half_w, r_disc, g_max
 
     def theta_f_dot(self, v_f, omega, g):
         return (self.L_r * omega + v_f * math.sin(g)) / (self.L_f * math.cos(g) + self.L_r)
 
-    def integrate(self, state, v_f, omega, dt):
+    def integrate_euler(self, state, v_f, omega, dt):
         xf, yf, th_f, g = state
         at_limit = (g >= self.g_max and omega > 0) or (g <= -self.g_max and omega < 0)
         eff_omega = 0.0 if at_limit else omega
@@ -210,6 +213,36 @@ class AFSKinematics:
         th_f = math.atan2(math.sin(th_f + dt * thd), math.cos(th_f + dt * thd))
         g = float(np.clip(g + dt * eff_omega, -self.g_max, self.g_max))
         return np.array([xf, yf, th_f, g])
+
+    def f_c(self, state, v_f, omega):
+        """Continuous kinematics qdot = f_c(q, u), no limits applied."""
+        _, _, th_f, g = state
+        return np.array([
+            v_f * math.cos(th_f),
+            v_f * math.sin(th_f),
+            self.theta_f_dot(v_f, omega, g),
+            omega,
+        ])
+
+    def integrate(self, state, v_f, omega, dt):
+        """RK4 step. The articulation stop is applied by zeroing omega before
+        integrating, not by clipping gamma afterwards: at the stop the actuator
+        produces no motion, so it must not contribute its L_r*omega term to
+        theta_f_dot either. Clipping after the fact would credit the heading
+        with a joint rotation that never happened."""
+        _, _, _, g = state
+        at_limit = (g >= self.g_max and omega > 0) or (g <= -self.g_max and omega < 0)
+        om = 0.0 if at_limit else omega
+
+        k1 = self.f_c(state, v_f, om)
+        k2 = self.f_c(state + 0.5 * dt * k1, v_f, om)
+        k3 = self.f_c(state + 0.5 * dt * k2, v_f, om)
+        k4 = self.f_c(state + dt * k3, v_f, om)
+        out = state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+        out[2] = math.atan2(math.sin(out[2]), math.cos(out[2]))   # wrap heading
+        out[3] = float(np.clip(out[3], -self.g_max, self.g_max))  # guard rounding
+        return out
 
     def frames(self, state):
         xf, yf, th_f, g = state
@@ -234,22 +267,29 @@ class AFSSimNode(Node):
     def __init__(self):
         super().__init__("afs_sim")
         p = self.declare_parameter
-        self.L_f = p("link_front", 0.5).value     # front axle -> hinge
-        self.L_r = p("link_rear", 0.5).value      # hinge -> rear axle
-        self.half_w = p("half_width", 0.22).value
-        self.r_disc = p("disc_radius", 0.28).value
+        self.L_f = p("link_front", 1.1059).value     # front axle -> hinge
+        self.L_r = p("link_rear", 0.985777778).value      # hinge -> rear axle
+        self.half_w = p("half_width", 0.9).value
+        self.r_disc = p("disc_radius", 1.5).value
         self.g_max = p("gamma_max", 0.75).value
         self.v_max = p("v_max", 1.2).value
         self.omega_max = p("omega_max", 1.2).value
         self.sim_rate = p("sim_rate", 100.0).value
         self.map_yaml = p("map_yaml", _default_map_path()).value
+
+        self.body_f_len = p("body_front_length", 1.7).value
+        self.body_r_len = p("body_rear_length", 2.4).value
+        self.body_f_cx = p("body_front_center_x", -self.L_f / 2).value
+        self.body_r_cx = p("body_rear_center_x", -self.L_r / 2).value
+        self.unknown_is_obstacle = p("unknown_is_obstacle", True).value
+
         start = p("start_pose", [6.0, 2.0, 1.5708, 0.0]).value
 
         # Save start pose
         self.state = np.array(start, dtype=float)
         self.start_pose = self.state.copy()
 
-        self.gt = GroundTruthMap(self.map_yaml)
+        self.gt = GroundTruthMap(self.map_yaml, self.unknown_is_obstacle)
         self.kin = AFSKinematics(self.L_f, self.L_r, self.half_w, self.r_disc, self.g_max)
         self.state = np.array(start, dtype=float)
         self.cmd = np.zeros(2)            # [v_f, omega]
@@ -342,14 +382,25 @@ class AFSSimNode(Node):
 
     def publish_body_markers(self, stamp, hit):
         ma = MarkerArray()
-        # front body spans base_link origin (front axle) back to hinge (-L_f)
-        # rear body spans hinge back to rear axle (-L_r) in rear_link
-        for idx, (frame, length) in enumerate([("base_link", self.L_f), ("rear_link", self.L_r)]):
-            m = Marker(); m.header.stamp = stamp; m.header.frame_id = frame
-            m.ns = "body"; m.id = idx; m.type = Marker.CUBE; m.action = Marker.ADD
-            m.pose.position.x = -length / 2.0
+        # Body boxes are drawn from explicit length/centre params, NOT from the
+        # kinematic links: L_f/L_r are axle->hinge distances, which are shorter
+        # than the actual bodies. body_*_cx is the box centre along -x in each
+        # body frame (base_link: x=0 at front axle; rear_link: x=0 at hinge).
+        bodies = [("base_link", self.body_f_len, self.body_f_cx),
+                  ("rear_link", self.body_r_len, self.body_r_cx)]
+        for idx, (frame, length, cx) in enumerate(bodies):
+            m = Marker()
+            m.header.stamp = stamp
+            m.header.frame_id = frame
+            m.ns = "body"
+            m.id = idx
+            m.type = Marker.CUBE
+            m.action = Marker.ADD
+            m.pose.position.x = float(cx)
             m.pose.orientation.w = 1.0
-            m.scale.x = length; m.scale.y = 2 * self.half_w; m.scale.z = 0.3
+            m.scale.x = float(length)
+            m.scale.y = 2 * self.half_w
+            m.scale.z = 0.3
             m.color.a = 0.9
             if hit:
                 m.color.r = 0.9
