@@ -52,7 +52,8 @@ class KeyboardTeleop(Node):
         self.rate = float(self.get_parameter('rate').value)
         self.decay = float(self.get_parameter('decay_timeout').value)
         self.ramp = float(self.get_parameter('ramp').value)
-
+        self.btn_assist = 0
+        self.btn_reset = 0
         self.pub = self.create_publisher(Joy, topic, 10)
         self.drive = 0.0   # current (ramped) output
         self.steer = 0.0
@@ -82,42 +83,41 @@ class KeyboardTeleop(Node):
                 with self.lock:
                     if c == 'w':
                         self.t_drive = 1.0
-                        self.last_drive_key = time.time()
                     elif c == 's':
                         self.t_drive = -1.0
-                        self.last_drive_key = time.time()
                     elif c == 'a':
                         self.t_steer = 1.0
-                        self.last_steer_key = time.time()
                     elif c == 'd':
                         self.t_steer = -1.0
-                        self.last_steer_key = time.time()
+                    elif c == 'e':
+                        self.t_steer = 0.0      # centre steering, keep driving
+                    elif c == 'f':
+                        self.t_drive = 0.0      # coast, keep steering angle
                     elif c in (' ', 'x'):
                         self.t_drive = 0.0
                         self.t_steer = 0.0
-                        self.last_drive_key = 0.0
-                        self.last_steer_key = 0.0
-                    elif c in ('q', '\x03'):   # q or Ctrl-C
+                    elif c == 'c':
+                        self.btn_assist = 1
+                    elif c == 'r':
+                        self.btn_reset = 1
+                    elif c in ('q', '\x03'):
                         self.alive = False
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
         rclpy.try_shutdown()
 
     def _tick(self):
-        now = time.time()
         with self.lock:
-            if now - self.last_drive_key > self.decay:   # this axis released -> coast to stop
-                self.t_drive = 0.0
-            if now - self.last_steer_key > self.decay:   # independent of drive's state
-                self.t_steer = 0.0
             td, ts = self.t_drive, self.t_steer
+            buttons = [self.btn_assist, self.btn_reset]
+            self.btn_assist = self.btn_reset = 0
         step = self.ramp / self.rate
         self.drive += max(-step, min(step, td - self.drive))
         self.steer += max(-step, min(step, ts - self.steer))
         msg = Joy()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.axes = [float(self.steer), float(self.drive)]   # [steer, drive]
-        msg.buttons = []
+        msg.axes = [float(self.steer), float(self.drive)]
+        msg.buttons = buttons
         self.pub.publish(msg)
 
 

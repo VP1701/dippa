@@ -57,6 +57,148 @@ from geometry_msgs.msg import Twist, TransformStamped, Quaternion
 from nav_msgs.msg import Odometry, OccupancyGrid
 from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import TransformBroadcaster
+from array import array
+
+LATERAL = {
+    'line': lambda s, amp, cyc: 0.0,
+    'parabola': lambda s, amp, cyc: amp * 4.0 * s * (1.0 - s),
+    'sine': lambda s, amp, cyc: amp * math.sin(2.0 * math.pi * cyc * s),
+}
+ 
+ 
+class MovingObstacle:
+    """Circular obstacle travelling A -> B at constant speed.
+ 
+    The path is the chord A->B plus a lateral offset:
+ 
+        r(s) = a + s*L*e + lat(s)*n,    s in [0, 1]
+ 
+    with e the unit tangent of the chord and n its left normal. s is a path
+    parameter, not arc length, so a constant ds/dt would give a varying
+    speed on any curved shape. Integrating
+ 
+        ds/dt = direction * speed / ||r'(s)||
+ 
+    instead gives ||dr/dt|| = speed exactly, for every shape. Since e and n
+    are orthogonal, ||r'(s)|| = sqrt(L^2 + lat'(s)^2) >= L > 0, so the
+    division is always well posed.
+ 
+    Args:
+        start, goal: (x, y) endpoints in map coordinates [m].
+        speed: constant path speed [m/s].
+        radius: obstacle radius [m].
+        shape: key into LATERAL.
+        amplitude: peak lateral offset [m]; ignored by 'line'.
+        cycles: number of sine periods over one A->B traverse.
+        mode: 'once' (stop at B), 'loop' (jump back to A), or 'pingpong'.
+    """
+ 
+    def __init__(self, start, goal, speed, radius=0.4, shape='line',
+                 amplitude=0.0, cycles=1.0, mode='pingpong'):
+        if shape not in LATERAL:
+            raise ValueError(f"unknown shape {shape!r}, expected one of "
+                             f"{sorted(LATERAL)}")
+        if mode not in ('once', 'loop', 'pingpong'):
+            raise ValueError(f"unknown mode {mode!r}, expected 'once', "
+                             f"'loop' or 'pingpong'")
+ 
+        self.a = np.asarray(start, dtype=float)
+        self.b = np.asarray(goal, dtype=float)
+        d = self.b - self.a
+        self.L = float(np.linalg.norm(d))
+        if self.L < 1e-9:
+            raise ValueError("start and goal must differ")
+ 
+        self.e = d / self.L
+        self.n = np.array([-self.e[1], self.e[0]])
+        self.speed = float(speed)
+        self.radius = float(radius)
+        self.amplitude = float(amplitude)
+        self.cycles = float(cycles)
+        self.shape = shape
+        self.mode = mode
+        self._lat = LATERAL[shape]
+        self.reset()
+ 
+    def reset(self):
+        self.s = 0.0
+        self.direction = 1.0
+        self.done = False
+ 
+    # ------------------------------------------------------------- geometry
+    def _offset(self, s):
+        return self._lat(s, self.amplitude, self.cycles)
+ 
+    def _deriv(self, s, h=1e-4):
+        """r'(s), central-differenced through the scalar offset function so a
+        new shape needs no hand-derived derivative."""
+        dlat = (self._offset(s + h) - self._offset(s - h)) / (2.0 * h)
+        return self.L * self.e + dlat * self.n
+ 
+    @property
+    def position(self):
+        return self.a + self.s * self.L * self.e + self._offset(self.s) * self.n
+ 
+    @property
+    def velocity(self):
+        """Exact velocity vector; its magnitude is `speed` by construction."""
+        if self.done:
+            return np.zeros(2)
+        d = self._deriv(self.s)
+        return self.direction * self.speed * d / np.linalg.norm(d)
+ 
+    # ---------------------------------------------------------- integration
+    def _s_dot(self, s):
+        return self.direction * self.speed / np.linalg.norm(self._deriv(s))
+ 
+    def step(self, dt):
+        """Advance the path parameter by one RK4 step of dt seconds."""
+        if self.done:
+            return
+        k1 = self._s_dot(self.s)
+        k2 = self._s_dot(self.s + 0.5 * dt * k1)
+        k3 = self._s_dot(self.s + 0.5 * dt * k2)
+        k4 = self._s_dot(self.s + dt * k3)
+        self.s += (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        self._apply_mode()
+ 
+    def _apply_mode(self):
+        if 0.0 <= self.s <= 1.0:
+            return
+        if self.mode == 'once':
+            self.s = float(np.clip(self.s, 0.0, 1.0))
+            self.done = True
+        elif self.mode == 'loop':
+            self.s %= 1.0
+        else:                                   # pingpong
+            # Reflect rather than clamp: the path length covered this step is
+            # preserved, so the speed stays constant through the turnaround.
+            if self.s > 1.0:
+                self.s = 2.0 - self.s
+                self.direction = -1.0
+            else:
+                self.s = -self.s
+                self.direction = 1.0
+ 
+ 
+def disc_mask(radius, res):
+    """Boolean stencil of a disc of `radius` m on a `res` m/cell grid."""
+    rad = int(np.ceil(radius / res))
+    yy, xx = np.ogrid[-rad:rad + 1, -rad:rad + 1]
+    return (xx * xx + yy * yy) <= rad * rad
+ 
+ 
+def stamp_disc(grid, mask, ic, jc, value=100):
+    """Write `value` into `grid` where the disc stencil lands, clipped to the
+    grid bounds. `ic, jc` are the (col, row) cell indices of the centre."""
+    r = mask.shape[0] // 2
+    ny, nx = grid.shape
+    j0, j1 = max(0, jc - r), min(ny, jc + r + 1)
+    i0, i1 = max(0, ic - r), min(nx, ic + r + 1)
+    if j1 <= j0 or i1 <= i0:
+        return
+    sub = mask[j0 - jc + r:j1 - jc + r, i0 - ic + r:i1 - ic + r]
+    grid[j0:j1, i0:i1][sub] = value
 
 
 def yaw_to_quat(yaw):
@@ -285,11 +427,35 @@ class AFSSimNode(Node):
 
         start = p("start_pose", [6.0, 2.0, 1.5708, 0.0]).value
 
+        # Moving obstacle pose
+        self.obs_enable = p("obs_enable", True).value
+        self.obs_start = p("obs_start", [51.0, 60.0]).value
+        self.obs_goal = p("obs_goal", [60.0, 70.0]).value
+        self.obs_speed = p("obs_speed", 0.5).value
+        self.obs_radius = p("obs_radius", 0.4).value
+        self.obs_shape = p("obs_shape", "line").value
+        self.obs_amplitude = p("obs_amplitude", 0.0).value
+        self.obs_cycles = p("obs_cycles", 1.0).value
+        self.obs_mode = p("obs_mode", "pingpong").value
+        self.map_rate = p("map_rate", 10.0).value
+
+
         # Save start pose
         self.state = np.array(start, dtype=float)
         self.start_pose = self.state.copy()
 
         self.gt = GroundTruthMap(self.map_yaml, self.unknown_is_obstacle)
+
+        self.obs = None
+        self._static_grid = self.gt.occupancy_grid_data()
+        if self.obs_enable:
+            self.obs = MovingObstacle(
+                self.obs_start, self.obs_goal, self.obs_speed,
+                self.obs_radius, self.obs_shape, self.obs_amplitude,
+                self.obs_cycles, self.obs_mode)
+            self._obs_mask = disc_mask(self.obs_radius, self.gt.res)
+
+
         self.kin = AFSKinematics(self.L_f, self.L_r, self.half_w, self.r_disc, self.g_max)
         self.state = np.array(start, dtype=float)
         self.cmd = np.zeros(2)            # [v_f, omega]
@@ -303,6 +469,9 @@ class AFSSimNode(Node):
         self.pub_art = self.create_publisher(Float64, "afs/articulation", 10)
         self.pub_col = self.create_publisher(Bool, "afs/collision", 10)
         self.pub_mark = self.create_publisher(MarkerArray, "afs/markers", 10)
+        self.pub_obs = self.create_publisher(
+            Float64MultiArray, "afs/moving_obstacle", 10)
+
         self.tf = TransformBroadcaster(self)
         self.create_subscription(Float64MultiArray, "afs/cmd", self.cmd_cb, 10)
         self.create_subscription(Twist, "cmd_vel", self.twist_cb, 10)
@@ -310,13 +479,30 @@ class AFSSimNode(Node):
 
         self._map_msg = self._build_map_msg()
         self.pub_map.publish(self._map_msg)          # latched (transient local) copy
-        self.create_timer(2.0, self._republish_map)   # belt-and-braces for late RViz joins
+
+        map_period = 1.0 / self.map_rate if self.obs is not None else 2.0
+        self.create_timer(map_period, self._republish_map)
+ 
+        if self.obs is not None:
+            mb = self.gt.nx * self.gt.ny / 1e6
+            self.get_logger().info(
+                f"Moving obstacle: {self.obs_shape} {self.obs_start} -> "
+                f"{self.obs_goal}, {self.obs_speed} m/s, r={self.obs_radius} m, "
+                f"mode={self.obs_mode}. Republishing /map at {self.map_rate} Hz "
+                f"({mb:.2f} MB/msg, {mb * self.map_rate:.1f} MB/s).")
+
 
         self.create_timer(self.dt, self.sim_step)
         self.get_logger().info(
             f"AFS sim (front-referenced) up. Static map loaded from {self.map_yaml} "
             f"({self.gt.nx}x{self.gt.ny} @ {self.gt.res} m/cell). "
             "cmd [v_f, omega] on /afs/cmd or /cmd_vel.")
+
+    def _obs_trajectory(self):
+        """use this for integrator. need to finish"""
+        d = obs_end_pose - obs_start_pos
+        L = np.linalg.norm(d)
+        tangent = d / L 
 
     def _build_map_msg(self):
         msg = OccupancyGrid()
@@ -328,16 +514,35 @@ class AFSSimNode(Node):
         msg.info.origin.position.x = float(self.gt.origin[0])
         msg.info.origin.position.y = float(self.gt.origin[1])
         msg.info.origin.orientation.w = 1.0
-        msg.data = self.gt.occupancy_grid_data().flatten().tolist()
+        # array('b') skips rclpy's per-element type check that .tolist() incurs
+        # (~15x faster, and the difference matters once this runs at map_rate).
+        msg.data = array('b', self._grid_with_obstacle().tobytes())
         return msg
+
+    def _grid_with_obstacle(self):
+        """Static occupancy grid with the moving obstacle stamped in as
+        occupied. Returns the cached static grid untouched when disabled."""
+        if self.obs is None:
+            return self._static_grid
+        grid = self._static_grid.copy()
+        ic, jc = self.gt.world_to_cell(self.obs.position)
+        stamp_disc(grid, self._obs_mask, ic, jc)
+        return grid
+
 
     def reset_cb(self, msg):
         self.state = self.start_pose.copy()
         self.cmd = np.zeros(2)
-        self.get_logger().info(f"Reset -> state back to start pose {self.start_pose.tolist()}")
+        if self.obs is not None:
+            self.obs.reset()
+        self.get_logger().info(
+            f"Reset -> state back to start pose {self.start_pose.tolist()}")
 
     def _republish_map(self):
         self._map_msg.header.stamp = self.get_clock().now().to_msg()
+        if self.obs is not None:
+            self._map_msg.data = array('b',
+                                       self._grid_with_obstacle().tobytes())
         self.pub_map.publish(self._map_msg)
 
     def cmd_cb(self, msg):
@@ -364,8 +569,19 @@ class AFSSimNode(Node):
         self.pub_odom.publish(od)
         self.pub_art.publish(Float64(data=g))
 
-        hit = any(self.gt.clearance(c) < self.r_disc for c in self.kin.disc_centres(self.state))
+        centres = self.kin.disc_centres(self.state)
+        hit = any(self.gt.clearance(c) < self.r_disc for c in centres)
+        if self.obs is not None:
+            self.obs.step(self.dt)
+            p_obs = self.obs.position
+            lim = self.r_disc + self.obs.radius
+            hit = hit or any(np.hypot(*(c - p_obs)) < lim for c in centres)
+            v_obs = self.obs.velocity
+            self.pub_obs.publish(Float64MultiArray(data=[
+                float(p_obs[0]), float(p_obs[1]),
+                float(v_obs[0]), float(v_obs[1]), float(self.obs.radius)]))
         self.pub_col.publish(Bool(data=bool(hit)))
+
 
         # TF: front axle is base_link; hinge is L_f behind it; rear_link rotated by -gamma
         self._tf(now, "odom", "base_link", F[0], F[1], th_f)
