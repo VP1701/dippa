@@ -54,8 +54,11 @@ from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import (Buffer, TransformListener, LookupException,
                      ConnectivityException, ExtrapolationException)
 
-from safe_shared_control.afs_mpc import AFSMPC
+from safe_shared_control.afs_mpc import AFSMPC, ObstacleField
 from safe_shared_control.afs_model import AFSModel
+
+
+
 
 class StaticOGM:
     """Wraps a nav_msgs/OccupancyGrid message received once from /map with the
@@ -70,8 +73,6 @@ class StaticOGM:
         self._prob = None
         self._known = None
         self.unknown_is_obstacle = bool(unknown_is_obstacle)
-
-        
 
     def ready(self):
         return self._prob is not None
@@ -153,19 +154,19 @@ class AFSMPCNode(Node):
         self.L_r = p("link_rear", 0.985777778).value
         self.r_disc = p("disc_radius", 1.5).value
         self.g_max = p("gamma_max", 0.75).value
-        self.v_max = p("v_max", 1.2).value
+        self.v_max = p("v_max", 2.2).value
         self.omega_max = p("omega_max", 1.2).value
-        self.H = p("horizon", 8).value
+        self.H = p("horizon", 16).value
         self.dt = p("mpc_dt", 0.2).value
         self.gamma_cbf = p("cbf_gamma", 0.5).value
         self.margin = p("margin", 0.1).value
         self.influence_R = p("influence_radius", 1.5).value
         self.viz_polytopes = p("viz_polytopes", True).value
         self.viz_disc = p("viz_disc", 0).value      # which disc's polytope to draw (0=front axle)
-        self.q_v = p("track_v", 1.0).value
-        self.q_w = p("track_w", 0.3).value
-        self.r_v = p("smooth_v", 0.1).value
-        self.r_w = p("smooth_w", 0.25).value
+        self.q_v = p("track_v", 0.3).value
+        self.q_w = p("track_w", 1.0).value
+        self.r_v = p("smooth_v", 0.25).value
+        self.r_w = p("smooth_w", 0.1).value
         self.w_term = p("terminal_speed_weight", 1.0).value
         self.w_slack = p("slack_weight", 1e4).value
         self.w_slack_lin = p("slack_weight_lin", 1e3).value
@@ -186,12 +187,23 @@ class AFSMPCNode(Node):
         self.assist_button = p("assist_button", 0).value   # -1 to disable the toggle
         self.assist_default = p("assist_default", True).value  # start with the MPC filter on/off
         self.reset_button = p("reset_button", 1).value 
+        self.t_stop = p("stop_time", 0.5).value
+        self.cover_max_planes = p("cover_max_planes", 6).value
+        self.n_chunks = p("n_chunks", 6).value
 
         self.max_time = 1 / self.ctrl_rate
 
+        # front body spans [-1.403, +0.297], three segments of 0.567
+        front_x = [0.014, -0.553, -1.120]
+        # rear body spans [-1.693, +0.707] behind hinge, three segments of 0.800
+        rear_x  = [0.307, -0.493, -1.293]
+
+        discs = ([('f', x + self.L_f, 0.0) for x in front_x]
+         + [('r', x, 0.0) for x in rear_x])
+        # -> [(1.120, 0), (0.553, 0), (-0.014, 0), (0.307, 0), (-0.493, 0), (-1.293, 0)]
         # Set collision disc coordinates
-        discs = [(1.5 * self.L_f, 0), (0.5 * self.L_f, 0.0),
-                    (-0.5 * self.L_r, 0.0), (-1.0 * self.L_r, 0.0)]
+        """discs = [(1.5 * self.L_f, 0), (0.5 * self.L_f, 0.0),
+                    (-0.5 * self.L_r, 0.0), (-1.0 * self.L_r, 0.0)]"""
         self.model = AFSModel(self.L_f, self.L_r, self.r_disc, discs, self.dt)
         self.mpc = AFSMPC(self.model, H=self.H, gamma_cbf=self.gamma_cbf,
                             margin=self.margin, influence_R=self.influence_R,
@@ -201,7 +213,7 @@ class AFSMPCNode(Node):
                             v_max=self.v_max, omega_max=self.omega_max, g_max=self.g_max,
                             sqp_iters=self.sqp_iters,
                             intent_reset_thresh=self.intent_reset_thresh,
-                            eps_tol=self.eps_tol)
+                            eps_tol=self.eps_tol, t_stop=self.t_stop, cover_max_planes=self.cover_max_planes, n_chunks=self.n_chunks)
 
         # Fo visualization use shorter timestamps in same horizon
         self.viz_sub = 8
@@ -210,6 +222,12 @@ class AFSMPCNode(Node):
 
         self.unknown_is_obstacle = p("unknown_is_obstacle", True).value
         self.ogm = StaticOGM(True)
+        reach = self.v_max * self.H * self.dt + self.L_f + self.L_r
+        self.field_slack = p("field_slack", 3.0).value
+        self.field = ObstacleField(
+            half_width=reach + self.influence_R + self.field_slack,
+            halo=self.influence_R)
+        self._field_dirty = True
         self._map_msg = None
         self.map_frame = None
         self.tf_buffer = Buffer()
@@ -223,6 +241,9 @@ class AFSMPCNode(Node):
         self._prev_reset_btn = 0
         self._reversing = False
 
+        
+
+        
 
         self.pub = self.create_publisher(Float64MultiArray, "afs/cmd", 10)
         self.pub_reset = self.create_publisher(Empty, "afs/reset", 10)
@@ -317,9 +338,11 @@ class AFSMPCNode(Node):
             tf = self.tf_buffer.lookup_transform(
                 self.map_frame, src, Time.from_msg(msg.header.stamp),
                 timeout=Duration(seconds=0.05))
-        except (LookupException, ConnectivityException, ExtrapolationException):
+        except (LookupException, ConnectivityException,
+                ExtrapolationException) as e:
             self.pose = None
             self.state = None
+            self.get_logger().warn(f"TF lookup {self.map_frame} <- {src} failed: {e}")
             return
 
         px = msg.pose.pose.position.x
@@ -344,8 +367,9 @@ class AFSMPCNode(Node):
     def map_cb(self, msg):
         first = not self.ogm.ready()
         self.ogm.load_from_msg(msg)
+        self._field_dirty = True
         self._map_msg = msg
-        self.map_frame = msg.header.frame_id 
+        self.map_frame = msg.header.frame_id
         if first:
             self.get_logger().info(
                 f"Static map received: {msg.info.width}x{msg.info.height} "
@@ -353,6 +377,13 @@ class AFSMPCNode(Node):
 
     def control_tick(self):
         if self.state is None or not self.ogm.ready(): return
+        if self._field_dirty or self.field.needs_rebuild(self.state[:2], self.field_slack):
+            t0 = time.perf_counter()
+            self.field.rebuild(self.ogm, self.state[:2])
+            self._field_dirty = False
+            self.get_logger().info(f"EDT rebuild {1e3*(time.perf_counter()-t0):.1f} ms")
+        if not self.field.ready():
+            return
         if self._last_joy is None or \
             (self.get_clock().now() - self._last_joy).nanoseconds * 1e-9 > self.joy_timeout:
             self.v_cmd = 0.0; self.omega_cmd = 0.0
@@ -379,10 +410,10 @@ class AFSMPCNode(Node):
             self.pub.publish(Float64MultiArray(data=[float(u0[0]), float(u0[1])]))
             cx, cy = self.state[0], self.state[1]
             reach = self.v_max * self.H * self.dt + self.influence_R + self.L_f + self.L_r
-            clusters = build_clusters(self.ogm.prob(), self.ogm.res, self.ogm.origin,
+            """clusters = build_clusters(self.ogm.prob(), self.ogm.res, self.ogm.origin,
                                         self.ogm.nx, self.ogm.ny,
-                                        (cx - reach, cy - reach), (cx + reach, cy + reach))
-            min_h = self.mpc.min_clearance(self.state, clusters)
+                                        (cx - reach, cy - reach), (cx + reach, cy + reach))"""
+            min_h = self.mpc.min_clearance(self.state, self.field)
             self._publish_status(False, min_h < 0.0, bool(abs(u_user[0]) > 1e-3 or abs(u_user[1]) > 1e-3),
                                     {'min_h_now': min_h, 'slack_now': 0.0}, assist_off=True)
             return
@@ -390,11 +421,11 @@ class AFSMPCNode(Node):
         # clusters in a window around the vehicle
         cx, cy = self.state[0], self.state[1]
         reach = self.v_max * self.H * self.dt + self.influence_R + self.L_f + self.L_r
-        clusters = build_clusters(self.ogm.prob(), self.ogm.res, self.ogm.origin,
+        """clusters = build_clusters(self.ogm.prob(), self.ogm.res, self.ogm.origin,
                                     self.ogm.nx, self.ogm.ny,
-                                    (cx - reach, cy - reach), (cx + reach, cy + reach))
+                                    (cx - reach, cy - reach), (cx + reach, cy + reach))"""
         t0 = time.perf_counter()                          
-        u0, planned, qbar, ok, info = self.mpc.solve(self.state, self.u_prev, u_user, clusters)
+        u0, planned, qbar, ok, info = self.mpc.solve(self.state, self.u_prev, u_user, self.field)
         t1 = time.perf_counter()
         solve_time = t1 - t0
         #self.get_logger().info(f"MPC solve took {solve_time*1000:.1f} ms")
@@ -412,12 +443,16 @@ class AFSMPCNode(Node):
             self.mpc._useq_prev = None
             
         self.u_prev = u0
+        if (u0[0] < 0.0):
+            disc_ind = 3
+        else:
+            disc_ind = 0
         self.pub.publish(Float64MultiArray(data=[float(u0[0]), float(u0[1])]))
         if planned is not None:
             self._publish_path(self.pub_plan, self._viz_traj(planned))
         self._publish_status(infeasible, unsafe_now, driver_cmd, info)
         if self.viz_polytopes and planned is not None:
-            self._publish_polytopes(planned, self.mpc._last_relevant_clusters)
+            self._publish_polytopes(planned, disc_ind)
 
     def _publish_path(self, pub, traj):
         path = Path()
@@ -433,51 +468,80 @@ class AFSMPCNode(Node):
             path.poses.append(ps)
         pub.publish(path)
 
-    def _publish_polytopes(self, traj, clusters):
-        # For the chosen disc, at each predicted horizon position, intersect the
-        # tangent half-planes  n.(x - c) >= r_disc + margin  from every nearby
-        # obstacle into the convex feasible pocket for that disc CENTRE, and draw
-        # it as a polygon coloured by horizon step (green=now -> red=far). When a
-        # pocket pinches to nothing the step is skipped -> that gap is where the
-        # controller runs out of feasible room (i.e. why it brakes).
+    def _publish_polytopes(self, traj, disc_index):
+        """Draw the free-space pocket the MPC is actually enforcing: one convex
+        polygon per horizon chunk, coloured green (near) -> red (far). Each
+        plane is offset by r_disc + margin + T_stop * closing speed, so a
+        boundary the disc drives into visibly pulls in while one it passes
+        parallel to does not. A pocket that pinches shut is where the
+        controller has run out of room."""
+        chunks = self.mpc._last_planes
+        if disc_index >= len(chunks):
+            return
+        chunks = chunks[disc_index]
+
+        u_seq = self.mpc.planned_inputs()
+        if u_seq is None:
+            return
+
         arr = MarkerArray()
         clear = Marker(); clear.action = Marker.DELETEALL
         arr.markers.append(clear)
+
         r_m = self.r_disc + self.margin
+        T = self.mpc.T_stop
         R = self.influence_R
-        i = int(self.viz_disc)
-        H = len(traj)
-        for k, q in enumerate(traj):
-            p = self.model.disc_cords(q)[i]
-            poly = [(p[0] - R, p[1] - R), (p[0] + R, p[1] - R),
-                    (p[0] + R, p[1] + R), (p[0] - R, p[1] + R)]
-            for wpts in clusters:
-                dd = np.sqrt(((p[None, :] - wpts) ** 2).sum(1))
-                if dd.min() > R:
-                    continue
-                c = wpts[dd.argmin()]
-                nrm = p - c; nn = float(np.linalg.norm(nrm))
-                if nn < 1e-9:
-                    continue
-                nrm = nrm / nn
-                d = float(nrm[0] * c[0] + nrm[1] * c[1] + r_m)   # keep n.x >= d
-                poly = clip_halfplane(poly, nrm, d)
+        pts = np.array([self.model.disc_cords(q)[disc_index] for q in traj])
+        Gs = [self.model.disc_dyn_jacobians(q)[disc_index] for q in traj]
+
+        for j, (k0, k1, planes) in enumerate(chunks):
+            k1 = min(k1, len(pts) - 1)
+            if k0 > k1:
+                continue
+            sub = pts[k0:k1 + 1]
+            lo, hi = sub.min(0) - R, sub.max(0) + R
+            poly = [(lo[0], lo[1]), (hi[0], lo[1]), (hi[0], hi[1]), (lo[0], hi[1])]
+
+            for n, c in planes:
+                # Tightest offset any step in this chunk demands of this plane:
+                # the constraint binds hardest where the disc closes fastest.
+                v_cl = max(-float(n @ (Gs[k] @ u_seq[min(k, len(u_seq) - 1)]))
+                           for k in range(k0, k1 + 1))
+                d = float(n @ c) + r_m + T * max(0.0, v_cl)
+                poly = clip_halfplane(poly, n, d)
                 if len(poly) < 3:
                     break
             if len(poly) < 3:
-                continue                                   # pocket pinched shut
-            col = step_color(k, H)
+                continue                      # pocket pinched shut
+
+            col = step_color(j, len(chunks))
             m = Marker()
             m.header.frame_id = "odom"
             m.header.stamp = self.get_clock().now().to_msg()
-            m.ns = "polytope"; m.id = k
+            m.ns = "polytope"; m.id = j
             m.type = Marker.LINE_STRIP; m.action = Marker.ADD
-            m.scale.x = 0.02
-            m.color = ColorRGBA(r=float(col[0]), g=float(col[1]), b=float(col[2]), a=0.85)
+            m.scale.x = 0.04
+            m.color = ColorRGBA(r=float(col[0]), g=float(col[1]),
+                                b=float(col[2]), a=0.85)
             m.pose.orientation.w = 1.0
             for vx, vy in list(poly) + [poly[0]]:
                 m.points.append(Point(x=float(vx), y=float(vy), z=0.02))
             arr.markers.append(m)
+
+            for i, (_, c) in enumerate(planes):
+                a = Marker()
+                a.header = m.header
+                a.ns = "plane_anchor"; a.id = 100 * j + i
+                a.type = Marker.SPHERE; a.action = Marker.ADD
+                a.pose.position.x = float(c[0])
+                a.pose.position.y = float(c[1])
+                a.pose.position.z = 0.1
+                a.pose.orientation.w = 1.0
+                a.scale.x = a.scale.y = a.scale.z = 0.15
+                a.color = ColorRGBA(r=float(col[0]), g=float(col[1]),
+                                    b=float(col[2]), a=1.0)
+                arr.markers.append(a)
+
         self.pub_poly.publish(arr)
 
     def _rear_traj(self, traj):
@@ -527,7 +591,12 @@ class AFSMPCNode(Node):
             txt = "INSIDE KEEP-OUT  h=%.2f m" % info['min_h_now']
         else:
             col = (0.1, 0.9, 0.1)
-            txt = "OK  h=%.2f m  slack=%.03f" % (info['min_h_now'], info.get('slack_now', 0.0))
+            flags = "".join(c for c, f in
+                (("C", info.get('cover_incomplete')),
+                 ("S", info.get('seed_excluded')),
+                 ("W", info.get('out_of_window'))) if f)
+            txt = "OK  h=%.2f  slack=%.03f %s" % (info['min_h_now'],
+                                                info.get('slack_now', 0.0), flags)
         arr = MarkerArray()
         light = Marker()
         light.header.frame_id = "odom"

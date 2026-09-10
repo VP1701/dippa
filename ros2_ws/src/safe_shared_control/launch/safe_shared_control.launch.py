@@ -7,11 +7,16 @@ Launch arguments
   controller:=reactive|mpc      which shared controller     (default reactive)
   assist:=true|false            start with the CBF/MPC filter on or off
                                  (default true); toggle live at runtime with
-                                 the assist button (gamepad) or 'c' (keyboard)
+                                 the assist button (gamepad) or 'c' (keyboard),
+                                 unless study:=true, which locks the toggle
   manual:=true|false            TOTAL bypass: skip the joystick source and the
                                  controller/CBF/MPC node entirely, drive the
                                  sim directly via /cmd_vel with
                                  teleop_twist_keyboard (default false)
+  study:=true|false             run the user-study node: goal sequence, RViz
+                                 timer, CSV results (default false)
+  participant:=<id>             participant id logged with every result row
+  phase:=practice|trial         logged phase label
   map_yaml:=<path>              static map .yaml (map_server format);
                                  empty = sim's bundled default map (default '')
   rviz:=true|false              start RViz                  (default true)
@@ -30,6 +35,12 @@ Examples
   # or press 'c' (keyboard) / the assist button (gamepad) to toggle live
   # Total bypass -- no controller node in the loop at all, straight to the plant:
   ros2 launch safe_shared_control safe_shared_control.launch.py manual:=true
+  # User study, one run per launch (assist button is disabled so the condition
+  # cannot be changed mid-run):
+  ros2 launch safe_shared_control safe_shared_control.launch.py controller:=mpc \
+      study:=true participant:=P03 phase:=practice assist:=false
+  ros2 launch safe_shared_control safe_shared_control.launch.py controller:=mpc \
+      study:=true participant:=P03 phase:=trial assist:=true
 
 Gamepad needs ROS's joy driver (SDL2-based, publishes /joy):
   sudo apt install ros-humble-joy
@@ -47,7 +58,7 @@ Confirm executable names with:  ros2 pkg executables safe_shared_control
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 import os
@@ -59,6 +70,7 @@ EXE_SIM      = 'simulator_node'
 EXE_REACTIVE = 'controller_node'
 EXE_MPC      = 'mpc_controller_node'      # <-- confirm/adjust to your console_scripts name
 EXE_KEYBOARD = 'keyboard_teleop_node'     # <-- add this console_script + rebuild
+EXE_STUDY    = 'study_node'               # <-- add this console_script + rebuild
 
 # --- per-input presets passed to the controller node ---
 # axes 0/1 are LeftX / LeftY in BOTH the SDL2 'joy' node and the evdev
@@ -89,8 +101,14 @@ def launch_setup(context, *args, **kwargs):
     v_max = float(LaunchConfiguration('v_max').perform(context))
     omega_max = float(LaunchConfiguration('omega_max').perform(context))
     map_yaml = LaunchConfiguration('map_yaml').perform(context)
+    if not map_yaml:
+        map_yaml = os.path.join(FindPackageShare(PKG).perform(context),
+                                'maps', 'test_maze_edited.yaml')
     manual = LaunchConfiguration('manual').perform(context).lower() in ('1', 'true', 'yes')
     assist_default = LaunchConfiguration('assist').perform(context).lower() in ('1', 'true', 'yes')
+    study = LaunchConfiguration('study').perform(context).lower() in ('1', 'true', 'yes')
+    participant = LaunchConfiguration('participant').perform(context)
+    phase = LaunchConfiguration('phase').perform(context)
 
     if input_dev not in INPUT_PRESETS:
         raise RuntimeError(f"input must be one of {list(INPUT_PRESETS)}, got '{input_dev}'")
@@ -98,7 +116,9 @@ def launch_setup(context, *args, **kwargs):
 
     # start_pose is the FRONT axle [x, y, theta, gamma]; the body extends ~1.0 m
     # behind it, so keep x clear of the 0.3 m wall (rear axle = x - 1.0 at heading 0).
-    sim_params = {'start_pose': [50, 50, 0.0, 0.0]} # 1.5708
+    #sim_params = {'start_pose': [8.0, 3.5, 0.0, 0.0]}
+    #sim_params = {'start_pose': [50, 50, 0.0, 0.0]} # 1.5708
+    sim_params = {'start_pose': [5.5, 24.0, 1.5708, 0.0]} # Test maze
     if map_yaml:
         sim_params['map_yaml'] = map_yaml   # empty -> sim falls back to its bundled default map
     nodes = [Node(package=PKG, executable=EXE_SIM, name='simulator_node', output='screen',
@@ -149,15 +169,37 @@ def launch_setup(context, *args, **kwargs):
         ctrl_params.update(dict(v_max=v_max, omega_max=omega_max,   # speed / sensitivity
                                 joy_lpf_alpha=0.85,                  # lighter input filter = crisper
                                 assist_default=assist_default))      # start with CBF/MPC on/off
+        if study:
+            # Freeze the condition: a stray button press mid-run would flip the
+            # assist without the results CSV knowing about it.
+            ctrl_params['assist_button'] = -1
         if is_mpc:
             # NOTE: these node params are what actually take effect (they override the
             # AFSMPC class defaults). Tune the controller HERE, not in the .py signature.
-            ctrl_params.update(dict(horizon=8, mpc_dt=0.2, cbf_gamma=2.5,
-                                    margin=0.1, disc_radius=1.5, influence_radius=3.5,
+            ctrl_params.update(dict(horizon=12, mpc_dt=0.2, cbf_gamma=1.0,
+                                    margin=0.1, disc_radius=1.0, influence_radius=4.0,
                                     smooth_v=0.1, control_rate=20.0))
         nodes.append(Node(
             package=PKG, executable=(EXE_MPC if is_mpc else EXE_REACTIVE),
             name='shared_controller', output='screen', parameters=[ctrl_params],
+        ))
+
+    # user study: goal sequence, RViz timer, CSV results. Owns no command path,
+    # so the same node runs in every condition. manual:=true is logged as its
+    # own condition -- no controller in the loop at all is not the same
+    # baseline as the controller running with the filter switched off.
+    if study:
+        nodes.append(Node(
+            package=PKG, executable=EXE_STUDY, name='study', output='screen',
+            parameters=[{
+                'participant': participant,
+                'phase': phase,
+                'assist': assist_default and not manual,
+                'condition': ('bypass' if manual else
+                              'assist' if assist_default else 'manual'),
+                'joy_topic': preset['joy_topic'],
+                'link_front': 1.1059,
+            }],
         ))
 
     # visualization
@@ -191,11 +233,21 @@ def generate_launch_description():
                               description='start with the CBF/MPC filter on (true) or '
                                           'off/raw-passthrough (false); still toggleable '
                                           "live with 'c' (keyboard) or the assist button "
-                                          '(gamepad). Ignored if manual:=true.'),
+                                          '(gamepad) unless study:=true. Ignored if '
+                                          'manual:=true.'),
         DeclareLaunchArgument('manual', default_value='false',
                               description='TOTAL bypass: skip the joystick source and the '
                                           'controller/CBF/MPC node, drive the sim directly '
                                           'via /cmd_vel with teleop_twist_keyboard'),
+        DeclareLaunchArgument('study', default_value='false',
+                              description='run the user-study node: goal sequence, RViz '
+                                          'timer, CSV results. Also disables the assist '
+                                          'toggle so the condition is fixed for the run.'),
+        DeclareLaunchArgument('participant', default_value='P00',
+                              description='participant id written to every results row'),
+        DeclareLaunchArgument('phase', default_value='trial',
+                              choices=['practice', 'trial'],
+                              description='logged phase label'),
         DeclareLaunchArgument('map_yaml', default_value='',
                               description='absolute path to a map_server .yaml '
                                           '(static ground-truth map); empty = use '
@@ -204,8 +256,8 @@ def generate_launch_description():
         DeclareLaunchArgument('rviz_config', default_value='',
                               description='absolute path to a .rviz config; '
                                           'empty = use the installed package config'),
-        DeclareLaunchArgument('v_max', default_value='1.2',
-                              description='max drive speed m/s (lower = slower/less sensitive)'),
+        DeclareLaunchArgument('v_max', default_value='2.2',
+                              description='max drive speed m/s (lower = slower/less sensitive)'), # 1.2
         DeclareLaunchArgument('omega_max', default_value='1.2',
                               description='max articulation rate rad/s (lower = gentler steering)'),
         DeclareLaunchArgument('joy_dev', default_value='0',

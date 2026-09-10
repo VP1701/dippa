@@ -1,93 +1,265 @@
 Panels:
   - Class: rviz_common/Displays
+    Help Height: 70
     Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /OccupancyGrid1
+      Splitter Ratio: 0.5
+    Tree Height: 916
 Visualization Manager:
   Class: ""
   Displays:
-    - Class: rviz_default_plugins/Grid
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
       Name: Grid
-      Enabled: true
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 10
       Reference Frame: odom
+      Value: true
     - Class: rviz_default_plugins/TF
-      Name: TF
       Enabled: true
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+        base_link:
+          Value: true
+        hinge:
+          Value: true
+        odom:
+          Value: true
+        rear_link:
+          Value: true
       Marker Scale: 0.5
-    - Class: rviz_default_plugins/Map
-      Name: OccupancyGrid
-      Enabled: true
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+      Tree:
+        odom:
+          base_link:
+            hinge:
+              rear_link:
+                {}
+      Update Interval: 0
+      Value: true
+    - Alpha: 0.699999988079071
+      Class: rviz_default_plugins/Map
       Color Scheme: map
-      Topic:
-        Value: /afs/ogm
-        Durability Policy: Volatile
-        Reliability Policy: Reliable
-        History Policy: Keep Last
-    - Class: rviz_default_plugins/Map
-      Name: SafeRegion
+      Draw Behind: false
       Enabled: true
-      Alpha: 0.5
+      Name: OccupancyGrid
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map_updates
+      Use Timestamp: false
+      Value: true
+    - Alpha: 0.5
+      Class: rviz_default_plugins/Map
       Color Scheme: costmap
+      Draw Behind: false
+      Enabled: true
+      Name: SafeRegion
       Topic:
-        Value: /afs/safe_region
+        Depth: 5
         Durability Policy: Volatile
-        Reliability Policy: Reliable
+        Filter size: 10
         History Policy: Keep Last
-    - Class: rviz_default_plugins/LaserScan
-      Name: LaserScan
-      Enabled: true
-      Size (m): 0.05
+        Reliability Policy: Reliable
+        Value: /afs/safe_region
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /afs/safe_region_updates
+      Use Timestamp: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/LaserScan
       Color: 255; 0; 0
+      Color Transformer: ""
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: LaserScan
+      Position Transformer: ""
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.05000000074505806
+      Style: Flat Squares
       Topic:
-        Value: /scan
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
         Reliability Policy: Best Effort
-        History Policy: Keep Last
+        Value: /scan
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
     - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
       Name: VehicleAndObstacles
-      Enabled: true
+      Namespaces:
+        body: true
       Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
         Value: /afs/markers
-        Reliability Policy: Reliable
-        History Policy: Keep Last
-    - Class: rviz_default_plugins/Path
-      Name: IntentPath
-      Enabled: true
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
       Color: 255; 170; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
       Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: IntentPath
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
       Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
         Value: /afs/intent_path
-        Reliability Policy: Reliable
-        History Policy: Keep Last
-    - Class: rviz_default_plugins/Path
-      Name: PlannedPath
-      Enabled: true
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
       Color: 0; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
       Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: PlannedPath
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
       Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
         Value: /afs/planned_path
-        Reliability Policy: Reliable
-        History Policy: Keep Last
+      Value: true
     - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
       Name: FeasiblePolytopes
-      Enabled: true
+      Namespaces:
+        polytope: true
       Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
         Value: /afs/polytopes
-        Reliability Policy: Reliable
-        History Policy: Keep Last
+      Value: true
     - Class: rviz_default_plugins/MarkerArray
-      Name: StatusIndicator
       Enabled: true
+      Name: StatusIndicator
+      Namespaces:
+        status_light: true
+        status_text: true
       Topic:
-        Value: /afs/status
-        Reliability Policy: Reliable
+        Depth: 5
+        Durability Policy: Volatile
         History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /afs/status
+      Value: true
+  Enabled: true
   Global Options:
+    Background Color: 48; 48; 48
     Fixed Frame: odom
     Frame Rate: 30
+  Name: root
   Tools:
     - Class: rviz_default_plugins/MoveCamera
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
   Views:
     Current:
+      Angle: 0
       Class: rviz_default_plugins/TopDownOrtho
-      Scale: 40
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Scale: 15.62269401550293
       Target Frame: odom
-      X: 9.0
-      Y: 6.0
+      Value: TopDownOrtho (rviz_default_plugins)
+      X: 52.90237808227539
+      Y: 48.732913970947266
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1131
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd00000001000000000000015600000415fc0200000001fb000000100044006900730070006c006100790073010000003b00000415000000c700ffffff000005e20000041500000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Width: 1854
+  X: 1986
+  Y: 272

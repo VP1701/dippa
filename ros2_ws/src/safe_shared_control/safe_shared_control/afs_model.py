@@ -17,6 +17,11 @@ class AFSModel:
 
         self.I = np.eye(4)
 
+        self.discs = discs
+        self._is_front = np.array([b == 'f' for b, _, _ in discs])
+        self._dx = np.array([dx for _, dx, _ in discs], float)
+        self._dy = np.array([dy for _, _, dy in discs], float)
+
     def f_c(self, q, u):
         """ Continuous time kinematics of and AFS-vehicle"""
         _, _, th, g = q
@@ -171,16 +176,53 @@ class AFSModel:
         disc_coordinates = []
 
         # Disc are positioned relative to the center link frame
-        for disc_x, disc_y in self.discs:
-            if disc_x >= 0.0:
+        for body, disc_x, disc_y in self.discs:
+            if body == 'f':
                 disc_cord = center_link + disc_x * ef + disc_y * ef_perpendicular
             else:
                 disc_cord = center_link + disc_x * er + disc_y * er_perpendicular
-
             disc_coordinates.append(disc_cord)
-
         return disc_coordinates
 
+    def disc_geometry(self, qs):
+        """P (S,D,2), J (S,D,2,4), G (S,D,2,2) for a stack of states qs (S,4).
+
+        Batched replacement for looping disc_cords / disc_jacobians /
+        disc_dyn_jacobians over the horizon.
+        """
+        qs = np.atleast_2d(np.asarray(qs, float))
+        th, g = qs[:, 2], qs[:, 3]
+        thr = th - g
+
+        ef = np.stack([np.cos(th), np.sin(th)], -1)
+        er = np.stack([np.cos(thr), np.sin(thr)], -1)
+        efp = np.stack([-np.sin(th), np.cos(th)], -1)
+        erp = np.stack([-np.sin(thr), np.cos(thr)], -1)
+
+        f = self._is_front[None, :, None]
+        E = np.where(f, ef[:, None, :], er[:, None, :])
+        Ep = np.where(f, efp[:, None, :], erp[:, None, :])
+        dx, dy = self._dx[None, :, None], self._dy[None, :, None]
+
+        centre = qs[:, :2] - self.L_f * ef
+        P = centre[:, None, :] + dx * E + dy * Ep
+
+        S, D = P.shape[0], P.shape[1]
+        J = np.zeros((S, D, 2, 4))
+        J[:, :, 0, 0] = 1.0
+        J[:, :, 1, 1] = 1.0
+        J[:, :, :, 2] = -self.L_f * efp[:, None, :] + dx * Ep - dy * E
+        J[:, :, :, 3] = np.where(f, 0.0, -dx * Ep + dy * E)
+
+        term1 = self.L_f * np.cos(g) + self.L_r
+        B = np.zeros((S, 4, 2))
+        B[:, 0, 0] = np.cos(th)
+        B[:, 1, 0] = np.sin(th)
+        B[:, 2, 0] = np.sin(g) / term1
+        B[:, 2, 1] = self.L_r / term1
+        B[:, 3, 1] = 1.0
+
+        return P, J, np.einsum('sdij,sjk->sdik', J, B)
 
     def disc_jacobians(self, q):
         """J_i = d p_i / d q  (2x4) per disc, evaluated at q.
@@ -203,8 +245,8 @@ class AFSModel:
         er_perpendicular = np.array([-np.sin(thr), np.cos(thr)])
 
         Jacobians = []
-        for disc_x, disc_y in self.discs:
-            if disc_x >= 0.0:
+        for body, disc_x, disc_y in self.discs:
+            if body == 'f':
                 J = np.column_stack([
                     [1.0, 0.0],
                     [0.0, 1.0],
@@ -221,3 +263,13 @@ class AFSModel:
                 ])
             Jacobians.append(J)
         return Jacobians
+
+    def disc_dyn_jacobians(self, q):
+        """G_i = J_i * B_c"""
+        _, B_c = self.jac_c(q, np.zeros(2))
+        dyn_jacobians = []
+        for J in self.disc_jacobians(q):
+            G_i = J @ B_c
+            dyn_jacobians.append(G_i)
+
+        return dyn_jacobians

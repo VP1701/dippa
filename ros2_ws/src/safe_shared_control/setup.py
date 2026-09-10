@@ -29,6 +29,7 @@ setup(
             'controller_node = safe_shared_control.controller_node:main',
             'keyboard_teleop_node = safe_shared_control.keyboard_teleop_node:main',
             'mpc_controller_node = safe_shared_control.afs_mpc_controller_node:main',
+            'study_node = safe_shared_control.study_node:main',
         ],
     },
 )

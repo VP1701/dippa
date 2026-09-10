@@ -338,9 +338,11 @@ class GroundTruthMap:
 
 class AFSKinematics:
     """Front-referenced articulated kinematics."""
-    def __init__(self, L_f=1.1059, L_r=0.985777778, half_w=0.9, r_disc=1.5, g_max=0.75):
+    def __init__(self, L_f=1.1059, L_r=0.985777778, half_w=0.9, r_disc=1.0, g_max=0.75):
         self.L_f, self.L_r = L_f, L_r
         self.half_w, self.r_disc, self.g_max = half_w, r_disc, g_max
+        self.front_s = [x + L_f for x in (0.014, -0.553, -1.120)]
+        self.rear_t = [0.307, -0.493, -1.293]
 
     def theta_f_dot(self, v_f, omega, g):
         return (self.L_r * omega + v_f * math.sin(g)) / (self.L_f * math.cos(g) + self.L_r)
@@ -397,11 +399,16 @@ class AFSKinematics:
         return F, P, R, th_f, th_r
 
     def disc_centres(self, state):
-        F, P, R, th_f, th_r = self.frames(state)
+        """Six collision-disc centres, three per body, placed to cover the
+        actual body rectangles rather than the axle-to-hinge links. Offsets
+        are measured from the hinge along each body's own axis, matching the
+        controller's disc list -- keep the two in sync or the collision check
+        tests different geometry than the MPC constrains."""
+        _, P, _, th_f, th_r = self.frames(state)
         ef = np.array([math.cos(th_f), math.sin(th_f)])
         er = np.array([math.cos(th_r), math.sin(th_r)])
-        pts = [F - s * ef for s in (0.0, self.L_f / 2, self.L_f)]      # front body F..P
-        pts += [P - t * er for t in (self.L_r / 2, self.L_r)]          # rear body  P..R
+        pts = [P + s * ef for s in self.front_s]
+        pts += [P + t * er for t in self.rear_t]
         return pts
 
 
@@ -412,9 +419,9 @@ class AFSSimNode(Node):
         self.L_f = p("link_front", 1.1059).value     # front axle -> hinge
         self.L_r = p("link_rear", 0.985777778).value      # hinge -> rear axle
         self.half_w = p("half_width", 0.9).value
-        self.r_disc = p("disc_radius", 1.5).value
+        self.r_disc = p("disc_radius", 1.0).value
         self.g_max = p("gamma_max", 0.75).value
-        self.v_max = p("v_max", 1.2).value
+        self.v_max = p("v_max", 2.2).value
         self.omega_max = p("omega_max", 1.2).value
         self.sim_rate = p("sim_rate", 100.0).value
         self.map_yaml = p("map_yaml", _default_map_path()).value

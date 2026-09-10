@@ -5,13 +5,127 @@ from scipy import ndimage, sparse
 import osqp 
 import time
 
+class ObstacleField:
+    """Local EDT + nearest-obstacle-cell lookup around the vehicle.
+
+    Rebuilt when the map changes or the vehicle drifts out of the window.
+    Queries within `halo` of the window edge are unreliable (cells outside
+    the slice are invisible to the transform), so they are flagged rather
+    than silently clamped.
+    """
+
+    def __init__(self, half_width, halo, occ_thresh=0.6):
+        self.half_width = float(half_width)
+        self.halo = float(halo)
+        self.occ_thresh = float(occ_thresh)
+        self.res = None
+        self.origin = None       # world coords of the window's [0, 0] cell
+        self.centre = None       # world point the window was built around
+        self.dist = None         # (ny, nx) signed metres, negative inside obstacles
+        self.near = None         # (2, ny, nx) row/col index of nearest obstacle cell
+        self.out_of_window = False
+
+    def ready(self):
+        return self.dist is not None
+
+    def needs_rebuild(self, centre, slack):
+        if not self.ready():
+            return True
+        return float(np.linalg.norm(np.asarray(centre) - self.centre)) > slack
+
+    def rebuild(self, ogm, centre):
+        prob = ogm.prob()
+        n = int(np.ceil(self.half_width / ogm.res))
+        ci = int((centre[0] - ogm.origin[0]) / ogm.res)
+        ri = int((centre[1] - ogm.origin[1]) / ogm.res)
+        r0, r1 = max(0, ri - n), min(prob.shape[0], ri + n + 1)
+        c0, c1 = max(0, ci - n), min(prob.shape[1], ci + n + 1)
+
+        occ = prob[r0:r1, c0:c1] > self.occ_thresh
+        outside, idx = ndimage.distance_transform_edt(
+            ~occ, sampling=ogm.res, return_indices=True)
+        inside = ndimage.distance_transform_edt(occ, sampling=ogm.res)
+
+        self.dist = outside - inside
+        self.near = idx
+        self.occ = occ
+        self.edge = occ & ~ndimage.binary_erosion(occ)
+        self.res = ogm.res
+        self.origin = np.array([ogm.origin[0] + c0 * ogm.res,
+                                ogm.origin[1] + r0 * ogm.res])
+        self.centre = np.asarray(centre, float)
+        self.out_of_window = False
+
+    def _to_cell(self, p):
+        """World point -> (row, col) index, unclipped."""
+        return (int((p[1] - self.origin[1]) / self.res),
+                int((p[0] - self.origin[0]) / self.res))
+
+    def _to_world(self, rs, cs):
+        """Cell indices -> (N, 2) world coords of the cell centres."""
+        return np.stack([self.origin[0] + (cs + 0.5) * self.res,
+                         self.origin[1] + (rs + 0.5) * self.res], axis=1)
+
+    def query(self, pts):
+        """pts: (N, 2) world coords. Returns (dist, nearest).
+
+        dist is signed: negative means the point is inside an obstacle.
+        Sets out_of_window if any point is within `halo` of the edge.
+        """
+        pts = np.atleast_2d(np.asarray(pts, float))
+        ny, nx = self.dist.shape
+        lo = self.origin + self.halo
+        hi = self.origin + np.array([nx, ny]) * self.res - self.halo
+        if np.any(pts < lo) or np.any(pts > hi):
+            self.out_of_window = True
+
+        cols = np.clip(((pts[:, 0] - self.origin[0]) / self.res).astype(int),
+                       0, nx - 1)
+        rows = np.clip(((pts[:, 1] - self.origin[1]) / self.res).astype(int),
+                       0, ny - 1)
+        d = self.dist[rows, cols]
+        near = self._to_world(self.near[0, rows, cols], self.near[1, rows, cols])
+        return d, near
+
+    def _cells_in_box(self, lo, hi):
+        """Occupied cell centres inside the world-coord box [lo, hi]."""
+        ny, nx = self.occ.shape
+        c0 = max(0, int((lo[0] - self.origin[0]) / self.res))
+        r0 = max(0, int((lo[1] - self.origin[1]) / self.res))
+        c1 = min(nx, int((hi[0] - self.origin[0]) / self.res) + 1)
+        r1 = min(ny, int((hi[1] - self.origin[1]) / self.res) + 1)
+        if c1 <= c0 or r1 <= r0:
+            return np.empty((0, 2))
+        rs, cs = np.nonzero(self.edge[r0:r1, c0:c1])
+        if len(rs) == 0:
+            return np.empty((0, 2))
+        return self._to_world(rs + r0, cs + c0)
+
+    def cells_near(self, p, radius):
+        """Occupied cell centres within `radius` of world point p, as (M, 2)."""
+        p = np.asarray(p, float)
+        cells = self._cells_in_box(p - radius, p + radius)
+        if len(cells) == 0:
+            return cells
+        return cells[((cells - p) ** 2).sum(1) <= radius ** 2]
+
+    def cells_near_path(self, pts, radius):
+        """Occupied cell centres within `radius` of any point in pts (N, 2),
+        plus the squared distances to every point (M, N)."""
+        pts = np.atleast_2d(np.asarray(pts, float))
+        cells = self._cells_in_box(pts.min(0) - radius, pts.max(0) + radius)
+        if len(cells) == 0:
+            return cells, np.empty((0, len(pts)))
+        d2 = ((cells[:, None, :] - pts[None, :, :]) ** 2).sum(-1)
+        keep = d2.min(1) <= radius ** 2
+        return cells[keep], d2[keep]
 
 class AFSMPC:
     def __init__(self, model, H=8, gamma_cbf=2.5, margin=0.1,
                  influence_R=1.5, q_v=1.0, q_w=0.3, r_v=0.1, r_w=0.25,
                  w_term=1.0, w_slack=1e4, w_slack_lin=1e3,
                  v_max=1.2, omega_max=1.2, g_max=0.75,
-                 sqp_iters=1, intent_reset_thresh=1.0, eps_tol=0.03):
+                 sqp_iters=4, intent_reset_thresh=1.0, eps_tol=0.03, t_stop=0.0, cover_max_planes=3, n_chunks=3):
         self.model = model
         self.H = H
         self.dt =  model.dt
@@ -33,11 +147,89 @@ class AFSMPC:
         self._useq_prev = None
         self._u_user_prev = None
         self._last_relevant_clusters = []
+        self.n_chunks = int(n_chunks)
+
+        self.k_max = int(cover_max_planes)
+        self.cover_incomplete = False
+        self.seed_excluded = False
+        self._last_planes = []
+
+        self.T_stop = float(t_stop)
+
+        
+
+        # Initialize QP
+        self.prob = osqp.OSQP()
+
+        #self.setup_complete = False
 
     # --- index helpers into Z ---
     def iq(self, k):  return 6 * (k - 1)            # q~_k start (k=1..H)
     def idu(self, k): return 6 * self.H + 2 * k     # du_k start (k=0..H-1)
     def ieps(self, k): return 8 * self.H + (k - 1)  # eps_k      (k=1..H)
+
+    
+
+    def planned_inputs(self):
+        """u_k for k = 0..H-1 from the last solution, or None."""
+        if self.x_prev is None:
+            return None
+        return np.array([self.x_prev[self.iq(k + 1) + 4:self.iq(k + 1) + 6]
+                         for k in range(self.H)])
+
+    def _chunks(self, num_steps, n_chunks):
+        """Overlapping index ranges covering 0..num_steps-1, sharing endpoints."""
+        edges = np.linspace(0, num_steps - 1, n_chunks + 1).round().astype(int)
+        return [(edges[i], edges[i + 1]) for i in range(n_chunks)]
+
+    def _cover(self, path, cells, d2):
+        """Greedy half-plane cover of `cells` near `path`.
+
+        The nearest sub-path point per cell is computed once; the loop then
+        only masks a length-M vector instead of copying the (uncovered,
+        sub-path) block each iteration.
+        """
+        if len(cells) == 0:
+            return [], True
+        si_all = d2.argmin(1)
+        dmin = d2[np.arange(len(cells)), si_all]
+        near_mask = dmin <= self.influence_R ** 2
+        near = cells[near_mask]
+        if len(near) == 0:
+            return [], True
+        dmin, si_all = dmin[near_mask], si_all[near_mask]
+
+        work = dmin.copy()
+        planes = []
+        for _ in range(self.k_max):
+            ci = int(work.argmin())
+            if not np.isfinite(work[ci]):
+                return planes, True
+            c = near[ci]
+            v = path[si_all[ci]] - c
+            nn = float(np.linalg.norm(v))
+            if nn < 1e-9:
+                return planes, False
+            n = v / nn
+            planes.append((n, c))
+            work[(near @ n) <= (n @ c)] = np.inf
+        return planes, not np.isfinite(work).any()
+
+    def _plane_rows(self, plane, path, qbar_arr, J, G, q_aug_0, k0, k1,
+                    rows, cols, data, lo, up, r):
+        n, c = plane
+        d = float(n @ c) + self.model.r_disc + self.margin
+        a_q = np.einsum('j,kji->ki', n, J)          # (S,4), all steps at once
+        a_u = self.T_stop * np.einsum('j,kji->ki', n, G)
+        h = path @ n - d
+        b = h - np.einsum('ki,ki->k', a_q, qbar_arr[:, :4])
+
+        linearized = [None] * len(path)
+        for k in range(k0, k1 + 1):
+            if h[k] <= self.influence_R:
+                linearized[k] = (np.concatenate([a_q[k], a_u[k]]), b[k])
+        return self._obstacle_rows(linearized, q_aug_0, rows, cols, data,
+                                   lo, up, r)
 
     def _linearize_over_horizon(self, qbar, u_seq):
         """ Linearizes the LTV system per timestep
@@ -118,7 +310,14 @@ class AFSMPC:
                 results.append((nearest[k], dist[k], h[k]))
         return results
 
-    def _linearize_obstacle_clearance(self, disc_position, qbar_k, nearest_point, dist, h, disc_jacobian_k):
+    def _disc_horizon(self, disc_positions, field):
+        """One nearest-obstacle result per horizon step for one disc."""
+        dist, near = field.query(disc_positions)
+        h = dist - self.model.r_disc - self.margin
+        return [None if dist[k] > self.influence_R else (near[k], dist[k], h[k])
+                for k in range(len(disc_positions))]
+
+    def _linearize_obstacle_clearance(self, disc_position, qbar_k, nearest_point, dist, h, disc_jacobian_k, G_k):
         """ Linearizes the obstacle collision circle to a tangent line which creates
         a half plane shaped safe region
         
@@ -129,13 +328,15 @@ class AFSMPC:
         
         """
 
-        # calculate normal vector between obstacle point and vehicle point
-        normal = (disc_position - nearest_point) / dist
-        a = normal @ disc_jacobian_k
-        b = h - a @ qbar_k
+        # calculate normal vector n between obstacle point and vehicle point
+        n = (disc_position - nearest_point) / dist
+        a_q = n @ disc_jacobian_k
+        a_u = self.T_stop * (n @ G_k)
+        a = np.concatenate([a_q, a_u])
+        b = h - a_q @ qbar_k
         return a, b
 
-    def _linearize_disc_cluster_horizon(self, disc_positions, qbar, disc_jacobians, results):
+    def _linearize_disc_cluster_horizon(self, disc_positions, qbar, disc_jacobians, results, G_k):
         """
         
         
@@ -151,13 +352,13 @@ class AFSMPC:
             nearest_point, dist, h = result
 
             a, b = self._linearize_obstacle_clearance(disc_positions[k], qbar[k], nearest_point, dist, h,
-                disc_jacobians[k])
+                disc_jacobians[k], G_k[k])
 
             linearized.append((a, b))
 
         return linearized
 
-    def _obstacle_rows(self, linearized, q0, rows, cols, data, lo, up, r):
+    def _obstacle_rows(self, linearized, q_aug_0, rows, cols, data, lo, up, r):
         
         for k in range(self.H):
             if linearized[k] is None or linearized[k + 1] is None:
@@ -168,7 +369,7 @@ class AFSMPC:
 
             iq_k_next = self.iq(k + 1)
 
-            for b in range(4):
+            for b in range(6):
                 rows.append(r)
                 cols.append(iq_k_next + b)
                 data.append(a_k_next[b])
@@ -178,10 +379,10 @@ class AFSMPC:
             data.append(1.0)
 
             if k == 0:
-                lo.append((1 - self.alpha)*(a_k @ q0 + b_k) - b_k_next)
+                lo.append((1 - self.alpha)*(a_k @ q_aug_0 + b_k) - b_k_next)
             else:
                 iq_k = self.iq(k)
-                for b in range(4):
+                for b in range(6):
                     rows.append(r) #
                     cols.append(iq_k + b)
                     data.append(-(1 - self.alpha) * a_k[b])
@@ -192,9 +393,9 @@ class AFSMPC:
 
         return r
 
-    def _obstacle_constraint_rows(self, qbar, clusters, q0, rows, cols,
+    def _obstacle_constraint_rows_old(self, qbar, clusters, q_aug_0, rows, cols,
                                   data, lo, up, r):
-        """ Appends obstacle constraint rows for every collsiion disc
+        """ Appends obstacle constraint rows for every collision disc
         agains every obstacle cluster
         
         
@@ -207,9 +408,11 @@ class AFSMPC:
         # Get position and jacobian for each disc over the whole horizon
         position_at_step = []
         jacobian_at_step = [] 
+        dyn_jacobian_at_step = [] 
         for k in range(num_steps):
             position_at_step.append(self.model.disc_cords(qbar[k]))
             jacobian_at_step.append(self.model.disc_jacobians(qbar[k])) 
+            dyn_jacobian_at_step.append(self.model.disc_dyn_jacobians(qbar[k])) 
         #print(f"Len clusters before: {len(clusters)}")
         # Filter out irrelevant clusters
         all_positions = np.array(position_at_step).reshape(num_steps * num_discs, 2)
@@ -226,10 +429,11 @@ class AFSMPC:
         for disc_index in range(num_discs):
             disc_positions = []
             disc_jacobians = []
-
+            disc_dyn_jacobians = []
             for k in range(num_steps):
                 disc_positions.append(position_at_step[k][disc_index])
                 disc_jacobians.append(jacobian_at_step[k][disc_index])
+                disc_dyn_jacobians.append(dyn_jacobian_at_step[k][disc_index])
             disc_positions = np.array(disc_positions)
 
             # build obstacle row for disc against cluster
@@ -237,13 +441,49 @@ class AFSMPC:
                 horizon = self._disc_cluster_horizon(disc_positions, cluster)
 
                 linearized_obstacle = self._linearize_disc_cluster_horizon(
-                disc_positions, qbar, disc_jacobians, horizon)
+                disc_positions, qbar, disc_jacobians, horizon, disc_dyn_jacobians)
 
-                r = self._obstacle_rows(linearized_obstacle, q0, rows, cols, data,
+                r = self._obstacle_rows(linearized_obstacle, q_aug_0, rows, cols, data,
                                         lo, up, r)
 
         return r
 
+    def _obstacle_constraint_rows(self, qbar, field, q_aug_0, rows, cols,
+                                  data, lo, up, r):
+        """One greedy half-plane cover per (disc, horizon chunk), each plane
+        enforced over its own chunk's steps. Normals are fixed within a chunk
+        so the CBF recursion compares clearance to the same wall at k and k+1.
+        """
+        num_steps = self.H + 1
+        self.cover_incomplete = False
+        self.seed_excluded = False
+        self._last_planes = []
+
+        qbar_arr = np.asarray(qbar, float)
+        P, Jall, Gall = self.model.disc_geometry(qbar_arr)
+        chunks = self._chunks(num_steps, self.n_chunks)
+
+        for i in range(len(self.model.discs)):
+            path = P[:, i, :]
+            J, G = Jall[:, i], Gall[:, i]
+            cells, d2_full = field.cells_near_path(path, self.influence_R)
+
+            disc_planes = []
+            for k0, k1 in chunks:
+                sub = path[k0:k1 + 1]
+                planes, complete = self._cover(sub, cells,
+                                               d2_full[:, k0:k1 + 1])
+                if not complete:
+                    self.cover_incomplete = True
+                if any((sub @ n).min() < n @ c for n, c in planes):
+                    self.seed_excluded = True
+                disc_planes.append((k0, k1, planes))
+
+                for plane in planes:
+                    r = self._plane_rows(plane, path, qbar_arr, J, G, q_aug_0,
+                                         k0, k1, rows, cols, data, lo, up, r)
+            self._last_planes.append(disc_planes)
+        return r
 
     def _dynamics_rows(self, q0, u_prev, A_list, B_list, c_list, rows, cols,
                     data, lo, up, r):
@@ -345,8 +585,7 @@ class AFSMPC:
 
         return r
 
-
-    def min_clearance(self, q, clusters):
+    def min_clearance_old(self, q, clusters):
         """Smallest disc clearance across all discs and obstacle clusters,
         at a single pose q (h < 0 means a disc is already in the keep-out).
 
@@ -368,8 +607,11 @@ class AFSMPC:
                 _, _, h = result
                 hmin = min(hmin, h)
         return float(hmin)
-
-
+    def min_clearance(self, q, field):
+        pts = np.array(self.model.disc_cords(q))
+        d, _ = field.query(pts)
+        return float((d - self.model.r_disc - self.margin).min())
+        
     def _build_cost(self, u_user):
         """Builds the diagonal quadratic cost P and linear cost qv for the QP.
 
@@ -429,25 +671,67 @@ class AFSMPC:
         # Recreate constrain matrix for current iteration
         Ac = sparse.csc_matrix((data, (rows, cols)), shape=(num_rows, self.nz))
 
-        prob = osqp.OSQP()
         # Setup the QP
-        prob.setup(P=P, q=qv, A=Ac, l=np.array(lo), u=np.array(up),
+        self.prob.setup(P=P, q=qv, A=Ac, l=np.array(lo), u=np.array(up),
                 verbose=False, warm_starting=True, max_iter=8000,
                 eps_abs=1e-4, eps_rel=1e-4, polish=True)
 
         if x_ws is not None and len(x_ws) == self.nz:
             try:
-                prob.warm_start(x=x_ws)
+                self.prob.warm_start(x=x_ws)
             except Exception:
                 pass
 
-        res = prob.solve()
+        res = self.prob.solve()
         ok = (res.info.status_val in (1, 2) # 1 = OSQP_SOLVED, 2 = OSQP_SOLVED_INACCURATE
             and res.x is not None
             and np.all(np.isfinite(res.x)))
         return (res.x if ok else None), ok
 
-    def solve(self, q0, u_prev, u_user, clusters):
+    def _assemble_qp(self, P, qv, rows, cols, data, lo, up):
+        """Builds the sparse constraint matrix, solves the QP, and returns
+        the solution.
+
+        Args:
+            P: sparse (nz, nz) diagonal cost matrix, from _build_cost.
+            qv: array (nz,), linear cost vector, from _build_cost.
+            rows, cols, data: sparse-triplet entries for the constraint
+                matrix Ac, accumulated by the row-builder methods.
+            lo, up: lists of lower/upper bounds, one per constraint row.
+            x_ws: array (nz,) or None, warm-start guess for the primal
+                solution.
+
+        Returns:
+            x: array (nz,), the solution, or None if the solve failed.
+            ok: bool, whether the solve succeeded.
+        """
+        num_rows = len(lo)
+        # Recreate constrain matrix for current iteration
+        Ac = sparse.csc_matrix((data, (rows, cols)), shape=(num_rows, self.nz))
+
+        
+        # Setup the QP
+        self.prob.setup(P=P, q=qv, A=Ac, l=np.array(lo), u=np.array(up),
+                verbose=False, warm_starting=True, max_iter=8000,
+                eps_abs=1e-4, eps_rel=1e-4, polish=True)
+
+
+    def _solve_qp(self, qc, lo, up):
+        self.prob.update(q=qv , l=np.array(lo), u=np.array(up))
+        if x_ws is not None and len(x_ws) == self.nz:
+            try:
+                prob.warm_start(x=x_ws)
+            except Exception:
+                pass
+        res = self.prob.solve()
+        ok = (res.info.status_val in (1, 2) # 1 = OSQP_SOLVED, 2 = OSQP_SOLVED_INACCURATE
+            and res.x is not None
+            and np.all(np.isfinite(res.x)))
+        return (res.x if ok else None), ok
+
+
+
+    def solve(self, q0, u_prev, u_user, field):
         """Solves the CBF-MPC QP for one control tick.
 
         Args:
@@ -468,6 +752,7 @@ class AFSMPC:
         q0 = np.asarray(q0, float)
         u_prev = np.asarray(u_prev, float)
         u_user = np.asarray(u_user, float)
+        q_aug_0 = np.concatenate([q0, u_prev])
 
         # Check if the user command changed significantly. if not use the previous solution
         # as the nominal command for nominla trajectory calculation.
@@ -495,15 +780,20 @@ class AFSMPC:
             t1 = time.perf_counter()
 
             rows, cols, data, lo, up = [], [], [], [], []
+            
             r = 0
             r = self._dynamics_rows(q0, u_prev, A_list, B_list, c_list, rows, cols, data, lo, up, r)
             t2 = time.perf_counter()
-            r = self._obstacle_constraint_rows(qbar, clusters, q0, rows, cols, data, lo, up, r)
+            r = self._obstacle_constraint_rows(qbar, field, q_aug_0, rows, cols, data, lo, up, r)
             t3 = time.perf_counter()
             r = self._box_rows(u_user, rows, cols, data, lo, up, r)
             t4 = time.perf_counter()
 
             x, ok = self._assemble_and_solve(P, qv, rows, cols, data, lo, up, x_ws)
+            """if not self.setup_complete:
+                self._assemble_qp(P, qv, rows, cols, data, lo, up)
+            
+            x, ok = self._solve_qp(qv, lo, up)"""
             t5 = time.perf_counter()
 
             print(f"rollout+lin={1e3*(t1-t0):.1f}ms dyn={1e3*(t2-t1):.1f}ms "f"obstacles={1e3*(t3-t2):.1f}ms box={1e3*(t4-t3):.1f}ms "f"osqp={1e3*(t5-t4):.1f}ms", flush=True)
@@ -519,11 +809,13 @@ class AFSMPC:
                     list(qbar), x, u_seq)
 
         if best is None:
-            
             self._useq_prev = None
-            info = {'min_h_now': self.min_clearance(q0, self._last_relevant_clusters),
+            info = {'min_h_now': self.min_clearance(q0, field),
                     'slack_now': float('inf'), 'slack_max': float('inf'),
-                    'infeasible': True, 'solver_failed': True}
+                    'infeasible': True, 'solver_failed': True,
+                    'cover_incomplete': self.cover_incomplete,
+                    'seed_excluded': self.seed_excluded,
+                    'out_of_window': field.out_of_window}
             return np.zeros(2), None, [q0], False, info
 
         u0, planned, qbar, x, u_seq = best
@@ -531,8 +823,11 @@ class AFSMPC:
         self._useq_prev = u_seq
         slack_now = float(x[self.ieps(1)]) if self.H >= 1 else 0.0
         slack_max = float(max(x[self.ieps(k)] for k in range(1, self.H + 1)))
-        info = {'min_h_now': self.min_clearance(q0, self._last_relevant_clusters),
+        info = {'min_h_now': self.min_clearance(q0, field),
                 'slack_now': slack_now, 'slack_max': slack_max,
-                'infeasible': slack_now > self.eps_tol, 'solver_failed': False}
+                'infeasible': slack_now > self.eps_tol, 'solver_failed': False,
+                'cover_incomplete': self.cover_incomplete,
+                'seed_excluded': self.seed_excluded,
+                'out_of_window': field.out_of_window}
         return u0, planned, qbar, True, info
 
