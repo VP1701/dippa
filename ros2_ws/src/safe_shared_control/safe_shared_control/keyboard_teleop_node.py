@@ -1,139 +1,129 @@
 #!/usr/bin/env python3
 """
-keyboard_teleop_node.py -- WASD keyboard -> sensor_msgs/Joy for the AFS controller.
+keyboard_teleop_node.py -- WASD keyboard -> sensor_msgs/Joy, video game style.
 
-Publishes Joy on `topic` (default /joy) at a steady rate, axes = [steer, drive]
-in [-1, 1], so it feeds the shared controller exactly like a gamepad would (the
-CBF/MPC assist still applies -- this does NOT bypass it).
+A small pygame window reads the keyboard state every tick: an axis is
+driven while its key is held and returns to zero when it is released, and
+keys combine (W + A drives and steers).  A terminal cannot do this, since
+it only receives characters with the OS key repeat, never key releases.
 
-  w / s : drive forward / reverse
-  a / d : steer left / right
-  space : stop immediately
-  q     : quit
+  w / s : drive forward / reverse (hold)
+  a / d : steer left / right (hold)
+  c     : toggle assist      r : reset
+  q, Esc or closing the window : quit
 
-Hold a key to keep moving; release and it coasts to a stop. Must run in a
-terminal with keyboard focus (the launch file opens one via `xterm -e`), so it
-does not interfere with RViz.
+The window must have focus; without focus nothing counts as held.  Axes
+ramp toward their target at `ramp` axis units per second.  Publishes Joy on
+`topic` at `rate` Hz with axes = [steer, drive] and buttons = [assist,
+reset], like the previous terminal version.
 
-Notes:
-- `decay_timeout` (0.6 s) is set above the OS key-repeat *initial delay* so that
-  holding a key gives continuous motion instead of stuttering. If holding still
-  stutters, raise it; if it coasts too long after you release, lower it.
+Needs pygame:  sudo apt install python3-pygame
 """
-import sys
-import termios
-import tty
-import select
-import threading
-import time
+import os
 
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Joy
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 
-HELP = """
-========== AFS keyboard teleop (WASD) ==========
-  w / s : drive forward / reverse
-  a / d : steer left / right
-  space : stop      q : quit
-  (type in THIS window; hold to move)
-================================================
-"""
+import pygame  # noqa: E402
+import rclpy  # noqa: E402
+from rclpy.node import Node  # noqa: E402
+from sensor_msgs.msg import Joy  # noqa: E402
+
+BUTTONS = {pygame.K_c: 0, pygame.K_r: 1}          # Joy button index
+QUIT_KEYS = (pygame.K_q, pygame.K_ESCAPE)
+HELP = ("W/S drive   A/D steer", "C assist   R reset   Q quit")
+
+
+def key_axis(pressed, positive, negative):
+    """+1, -1 or 0 from two opposite keys; holding both cancels."""
+    return float(pressed[positive]) - float(pressed[negative])
+
+
+def ramp_toward(value, goal, step):
+    return value + max(-step, min(step, goal - value))
 
 
 class KeyboardTeleop(Node):
     def __init__(self):
-        super().__init__('keyboard_teleop')
-        self.declare_parameter('topic', '/joy')
-        self.declare_parameter('rate', 50.0)
-        self.declare_parameter('decay_timeout', 0.2)   # s without a key -> ramp to 0
-        self.declare_parameter('ramp', 3.0)            # axis units / s toward target
-        topic = self.get_parameter('topic').value
-        self.rate = float(self.get_parameter('rate').value)
-        self.decay = float(self.get_parameter('decay_timeout').value)
-        self.ramp = float(self.get_parameter('ramp').value)
-        self.btn_assist = 0
-        self.btn_reset = 0
+        super().__init__("keyboard_teleop")
+        p = self.declare_parameter
+        topic = p("topic", "/joy").value
+        self.rate = float(p("rate", 50.0).value)
+        self.ramp = float(p("ramp", 3.0).value)
         self.pub = self.create_publisher(Joy, topic, 10)
-        self.drive = 0.0   # current (ramped) output
+        self.drive = 0.0
         self.steer = 0.0
-        self.t_drive = 0.0  # target from last key
-        self.t_steer = 0.0
-        self.last_drive_key = 0.0   # per-axis decay clocks, so releasing
-        self.last_steer_key = 0.0   # one axis doesn't decay the other
-        self.lock = threading.Lock()
-        self.alive = True
+        self.quit = False
 
-        self.reader = threading.Thread(target=self._read_keys, daemon=True)
-        self.reader.start()
-        self.create_timer(1.0 / self.rate, self._tick)
-        sys.stdout.write(HELP)
-        sys.stdout.flush()
+        pygame.display.init()
+        pygame.font.init()
+        self.screen = pygame.display.set_mode((360, 130))
+        pygame.display.set_caption("AFS WASD teleop")
+        self.font = pygame.font.Font(None, 26)
+        self.create_timer(1.0 / self.rate, self.tick)
 
-    def _read_keys(self):
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            while self.alive:
-                r, _, _ = select.select([sys.stdin], [], [], 0.1)
-                if not r:
-                    continue
-                c = sys.stdin.read(1).lower()
-                with self.lock:
-                    if c == 'w':
-                        self.t_drive = 1.0
-                    elif c == 's':
-                        self.t_drive = -1.0
-                    elif c == 'a':
-                        self.t_steer = 1.0
-                    elif c == 'd':
-                        self.t_steer = -1.0
-                    elif c == 'e':
-                        self.t_steer = 0.0      # centre steering, keep driving
-                    elif c == 'f':
-                        self.t_drive = 0.0      # coast, keep steering angle
-                    elif c in (' ', 'x'):
-                        self.t_drive = 0.0
-                        self.t_steer = 0.0
-                    elif c == 'c':
-                        self.btn_assist = 1
-                    elif c == 'r':
-                        self.btn_reset = 1
-                    elif c in ('q', '\x03'):
-                        self.alive = False
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        rclpy.try_shutdown()
+    def tick(self):
+        buttons = [0, 0]
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.quit = True
+            elif event.type == pygame.KEYDOWN:
+                if event.key in QUIT_KEYS:
+                    self.quit = True
+                elif event.key in BUTTONS:
+                    buttons[BUTTONS[event.key]] = 1
 
-    def _tick(self):
-        with self.lock:
-            td, ts = self.t_drive, self.t_steer
-            buttons = [self.btn_assist, self.btn_reset]
-            self.btn_assist = self.btn_reset = 0
+        focused = pygame.key.get_focused()
+        pressed = pygame.key.get_pressed()
+        drive = key_axis(pressed, pygame.K_w, pygame.K_s) if focused else 0.0
+        steer = key_axis(pressed, pygame.K_a, pygame.K_d) if focused else 0.0
         step = self.ramp / self.rate
-        self.drive += max(-step, min(step, td - self.drive))
-        self.steer += max(-step, min(step, ts - self.steer))
+        self.drive = ramp_toward(self.drive, drive, step)
+        self.steer = ramp_toward(self.steer, steer, step)
+
+        self.publish(buttons)
+        self.draw(focused)
+
+    def publish(self, buttons=(0, 0)):
         msg = Joy()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.axes = [float(self.steer), float(self.drive)]
-        msg.buttons = buttons
+        msg.buttons = list(buttons)
         self.pub.publish(msg)
+
+    def draw(self, focused):
+        self.screen.fill((30, 30, 30))
+        lines = HELP + (f"drive {self.drive:+.2f}   steer {self.steer:+.2f}",)
+        for i, text in enumerate(lines):
+            image = self.font.render(text, True, (220, 220, 220))
+            self.screen.blit(image, (12, 12 + 28 * i))
+        if not focused:
+            image = self.font.render("click here to drive", True,
+                                     (255, 120, 80))
+            self.screen.blit(image, (12, 96))
+        pygame.display.flip()
+
+    def stop(self):
+        """Zero command, so the controller does not hold the last one."""
+        self.drive = self.steer = 0.0
+        self.publish()
 
 
 def main():
     rclpy.init()
     node = KeyboardTeleop()
     try:
-        rclpy.spin(node)
+        while rclpy.ok() and not node.quit:
+            rclpy.spin_once(node, timeout_sec=0.1)
     except KeyboardInterrupt:
         pass
     finally:
-        node.alive = False
+        if rclpy.ok():                  # after Ctrl-C ROS is already down
+            node.stop()
+        pygame.quit()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

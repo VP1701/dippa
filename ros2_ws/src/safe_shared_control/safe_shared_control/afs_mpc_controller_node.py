@@ -158,14 +158,14 @@ class AFSMPCNode(Node):
         self.omega_max = p("omega_max", 1.2).value
         self.H = p("horizon", 16).value
         self.dt = p("mpc_dt", 0.2).value
-        self.gamma_cbf = p("cbf_gamma", 0.5).value
+        self.gamma_cbf = p("cbf_gamma", 1.5).value
         self.margin = p("margin", 0.1).value
         self.influence_R = p("influence_radius", 1.5).value
         self.viz_polytopes = p("viz_polytopes", True).value
         self.viz_disc = p("viz_disc", 0).value      # which disc's polytope to draw (0=front axle)
-        self.q_v = p("track_v", 0.3).value
+        self.q_v = p("track_v", 0.6).value
         self.q_w = p("track_w", 1.0).value
-        self.r_v = p("smooth_v", 0.25).value
+        self.r_v = p("smooth_v", 0.5).value
         self.r_w = p("smooth_w", 0.1).value
         self.w_term = p("terminal_speed_weight", 1.0).value
         self.w_slack = p("slack_weight", 1e4).value
@@ -205,15 +205,7 @@ class AFSMPCNode(Node):
         """discs = [(1.5 * self.L_f, 0), (0.5 * self.L_f, 0.0),
                     (-0.5 * self.L_r, 0.0), (-1.0 * self.L_r, 0.0)]"""
         self.model = AFSModel(self.L_f, self.L_r, self.r_disc, discs, self.dt)
-        self.mpc = AFSMPC(self.model, H=self.H, gamma_cbf=self.gamma_cbf,
-                            margin=self.margin, influence_R=self.influence_R,
-                            q_v=self.q_v, q_w=self.q_w, r_v=self.r_v, r_w=self.r_w,
-                            w_term=self.w_term, w_slack=self.w_slack,
-                            w_slack_lin=self.w_slack_lin,
-                            v_max=self.v_max, omega_max=self.omega_max, g_max=self.g_max,
-                            sqp_iters=self.sqp_iters,
-                            intent_reset_thresh=self.intent_reset_thresh,
-                            eps_tol=self.eps_tol, t_stop=self.t_stop, cover_max_planes=self.cover_max_planes, n_chunks=self.n_chunks)
+        self.mpc = AFSMPC(self.model, **self._mpc_kwargs())
 
         # Fo visualization use shorter timestamps in same horizon
         self.viz_sub = 8
@@ -241,10 +233,6 @@ class AFSMPCNode(Node):
         self._prev_reset_btn = 0
         self._reversing = False
 
-        
-
-        
-
         self.pub = self.create_publisher(Float64MultiArray, "afs/cmd", 10)
         self.pub_reset = self.create_publisher(Empty, "afs/reset", 10)
         self.pub_map = self.create_publisher(OccupancyGrid, "afs/ogm", 1)
@@ -271,6 +259,24 @@ class AFSMPCNode(Node):
             f"AFS CBF-MPC ready (H={self.H}, dt={self.dt}). "
             f"Waiting for static map on {self.map_topic}. "
             f"assist={'ON' if self.assist else 'OFF (manual)'}")
+
+    def _mpc_kwargs(self):
+        """MPC settings from the node parameters, shared with subclasses."""
+        return dict(H=self.H, gamma_cbf=self.gamma_cbf, margin=self.margin,
+                    influence_R=self.influence_R, q_v=self.q_v, q_w=self.q_w,
+                    r_v=self.r_v, r_w=self.r_w, w_term=self.w_term,
+                    w_slack=self.w_slack, w_slack_lin=self.w_slack_lin,
+                    v_max=self.v_max, omega_max=self.omega_max,
+                    g_max=self.g_max, sqp_iters=self.sqp_iters,
+                    intent_reset_thresh=self.intent_reset_thresh,
+                    eps_tol=self.eps_tol, t_stop=self.t_stop,
+                    cover_max_planes=self.cover_max_planes,
+                    n_chunks=self.n_chunks)
+
+    def _stop_velocities(self):
+        """Velocities the stopping term multiplies, per planned step.
+        The kinematic MPC uses the planned commands."""
+        return self.mpc.planned_inputs()
 
     def _publish_discs(self, state):
         """Draws each collision disc as a flat circle at its current
@@ -480,7 +486,7 @@ class AFSMPCNode(Node):
             return
         chunks = chunks[disc_index]
 
-        u_seq = self.mpc.planned_inputs()
+        u_seq = self._stop_velocities()
         if u_seq is None:
             return
 

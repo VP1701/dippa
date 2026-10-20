@@ -122,7 +122,7 @@ class ObstacleField:
 
 class AFSMPC:
     def __init__(self, model, H=8, gamma_cbf=2.5, margin=0.1,
-                 influence_R=1.5, q_v=1.0, q_w=0.3, r_v=0.1, r_w=0.25,
+                 influence_R=1.5, q_v=1.0, q_w=0.6, r_v=0.1, r_w=0.5,
                  w_term=1.0, w_slack=1e4, w_slack_lin=1e3,
                  v_max=1.2, omega_max=1.2, g_max=0.75,
                  sqp_iters=4, intent_reset_thresh=1.0, eps_tol=0.03, t_stop=0.0, cover_max_planes=3, n_chunks=3):

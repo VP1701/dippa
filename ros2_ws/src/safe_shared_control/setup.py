@@ -15,6 +15,7 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'rviz'),   glob('rviz/*.rviz')),
         (os.path.join('share', package_name, 'maps'), glob('maps/*')), 
+        (os.path.join('share', package_name, 'models'), glob('models/*.pt')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -30,6 +31,8 @@ setup(
             'keyboard_teleop_node = safe_shared_control.keyboard_teleop_node:main',
             'mpc_controller_node = safe_shared_control.afs_mpc_controller_node:main',
             'study_node = safe_shared_control.study_node:main',
+            'dynamic_simulator_node = safe_shared_control.dynamic_simulator_node:main',
+            'dynamic_mpc_controller_node = safe_shared_control.dynamic_afs_mpc_controller_node:main',
         ],
     },
 )
